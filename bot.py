@@ -181,9 +181,18 @@ async def cmd_help(message: Message) -> None:
         "🔎 Найти лида — посмотреть карточку и сменить статус\n"
         "📊 Статистика — сводка по базе\n"
         "📅 Follow-up — кому сегодня писать повторно\n"
-        "📋 Показать всю базу — вся база целиком, пронумерованная (/5 откроет лида №5)\n\n"
+        "📋 Показать всю базу — вся база целиком, пронумерованная (/5 откроет лида №5)\n"
+        "/clear_db — полностью очистить базу (с подтверждением)\n\n"
         "Быстрая смена статуса: @username интерес / ответил / клиент / отказ / бан / удалено / архив",
         reply_markup=main_menu_kb(),
+    )
+
+
+@router.message(Command("clear_db"))
+async def cmd_clear_db(message: Message) -> None:
+    await message.answer(
+        "⚠️ Это удалит ВСЮ базу лидов без возможности восстановления. Продолжить?",
+        reply_markup=confirm_kb("clear_db"),
     )
 
 
@@ -324,6 +333,17 @@ async def cb_confirm_delete(callback: CallbackQuery) -> None:
     await db.set_status(username, db.STATUS_DELETED)
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.answer(f"🗑 @{username} помечен как удалённый.")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "confirm:clear_db")
+async def cb_confirm_clear_db(callback: CallbackQuery) -> None:
+    global last_batch, all_leads_index
+    count = await db.clear_all_leads()
+    last_batch = []
+    all_leads_index = []
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(f"🗑 База очищена. Удалено лидов: {count}")
     await callback.answer()
 
 

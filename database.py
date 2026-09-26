@@ -10,7 +10,7 @@ from __future__ import annotations
 import datetime as dt
 from typing import Optional
 
-from sqlalchemy import String, Integer, DateTime, select, func
+from sqlalchemy import String, Integer, DateTime, delete, select, func
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -60,7 +60,7 @@ QUICK_STATUS_WORDS: dict[str, str] = {
 # Модель и подключение
 # ---------------------------------------------------------------------------
 
-DB_PATH = "data/leads.db"
+DB_PATH = "leads.db"
 engine = create_async_engine(f"sqlite+aiosqlite:///{DB_PATH}")
 async_session = async_sessionmaker(engine, expire_on_commit=False)
 
@@ -110,6 +110,15 @@ async def add_leads(usernames: list[str]) -> tuple[list[str], list[str]]:
 # ---------------------------------------------------------------------------
 # Выдача новых лидов и отметка "отправлено"
 # ---------------------------------------------------------------------------
+
+async def clear_all_leads() -> int:
+    """Полностью удаляет всех лидов из базы. Возвращает, сколько было удалено."""
+    async with async_session() as session:
+        count = await session.scalar(select(func.count(Lead.id))) or 0
+        await session.execute(delete(Lead))
+        await session.commit()
+        return count
+
 
 async def get_all_leads() -> list[Lead]:
     async with async_session() as session:
