@@ -60,7 +60,7 @@ QUICK_STATUS_WORDS: dict[str, str] = {
 # Модель и подключение
 # ---------------------------------------------------------------------------
 
-DB_PATH = "leads.db"
+DB_PATH = "data/leads.db"
 engine = create_async_engine(f"sqlite+aiosqlite:///{DB_PATH}")
 async_session = async_sessionmaker(engine, expire_on_commit=False)
 
