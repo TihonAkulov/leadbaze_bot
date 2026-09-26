@@ -1,0 +1,5 @@
+aiogram>=3.4,<4
+SQLAlchemy>=2.0,<3
+aiosqlite>=0.19
+python-dotenv>=1.0
+sqlalchemy[asyncio]<3,>=2.0
