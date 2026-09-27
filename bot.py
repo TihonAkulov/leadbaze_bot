@@ -8,6 +8,7 @@ bot.py — Telegram-бот для ведения базы лидов (ручны
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import logging
 import os
 import re
@@ -16,7 +17,7 @@ from typing import Optional
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -46,9 +47,6 @@ logger = logging.getLogger("lead_bot")
 
 router = Router()
 
-# username в Telegram: 5-32 символов, буквы/цифры/подчёркивание
-USERNAME_BODY_RE = re.compile(r"^[A-Za-z0-9_]{5,32}$")
-
 # один токен: @username / username / t.me/username / telegram.me/username (с http(s):// или без)
 USERNAME_TOKEN_RE = re.compile(
     r"^(?:https?://)?(?:(?:t\.me|telegram\.me)/)?@?([A-Za-z0-9_]{5,32})/?$",
@@ -57,6 +55,9 @@ USERNAME_TOKEN_RE = re.compile(
 
 RANGE_RE = re.compile(r"^(\d+)\s*-\s*(\d+)$")
 SINGLE_NUM_RE = re.compile(r"^(\d+)$")
+
+# формат даты для /change_date: 28.09 / 28.09.2026 / 28.09 14:00
+DATE_INPUT_RE = re.compile(r"^(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?(?:\s+(\d{1,2}):(\d{2}))?$")
 
 # "последняя выданная пачка" — храним в памяти процесса, как договорились (V1)
 last_batch: list[str] = []
@@ -74,13 +75,16 @@ LEADS_PER_PAGE = 10
 # ---------------------------------------------------------------------------
 
 class Form(StatesGroup):
-    new_leads_count = State()      # ждём число "сколько лидов показать"
-    searching = State()            # ждём username для поиска
-    adding_note = State()          # ждём текст заметки
-    choosing_message = State()     # ждём выбор/ввод текста отправленного сообщения
-    msg_leads_range = State()      # /msg_leads: ждём диапазон номеров
-    msg_leads_confirm = State()    # /msg_leads: ждём подтверждения
-    stats_message_choice = State()  # /stats: ждём номер сообщения для детальной статистики
+    new_leads_count = State()          # ждём число "сколько лидов показать"
+    searching = State()                # ждём username для поиска
+    adding_note = State()              # ждём текст заметки лида
+    choosing_message = State()         # ждём выбор/ввод текста отправленного сообщения
+    msg_leads_range = State()          # /msg_leads: ждём выбор лидов
+    msg_leads_confirm = State()        # /msg_leads: ждём подтверждения
+    stats_message_choice = State()     # /stats: ждём номер сообщения для детальной статистики
+    change_status_selector = State()   # /change_status: ждём выбор лидов
+    change_date_selector = State()     # /change_date: ждём выбор лидов
+    change_date_value = State()        # /change_date: ждём новую дату
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +125,6 @@ def status_kb(lead: db.Lead) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🗑 Удалено", callback_data=f"st:{username}:deleted")],
         [InlineKeyboardButton(text="📦 Архив", callback_data=f"st:{username}:archive")],
     ]
-    # кнопка следующего фактического FU — только пока он ещё не отправлен, и только одна за раз
     if lead.status == db.STATUS_SENT:
         if lead.fu1_sent_at is None:
             rows.append([InlineKeyboardButton(text="✅ FU1 отправлен", callback_data=f"markfu1:{username}")])
@@ -129,6 +132,20 @@ def status_kb(lead: db.Lead) -> InlineKeyboardMarkup:
             rows.append([InlineKeyboardButton(text="✅ FU2 отправлен", callback_data=f"markfu2:{username}")])
     rows.append([InlineKeyboardButton(text="📝 Заметка", callback_data=f"note:{username}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def bulk_status_kb() -> InlineKeyboardMarkup:
+    """Клавиатура выбора статуса для массового изменения (/change_status) — не привязана к одному username."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🟡 Отправлено", callback_data="bulkstatus:sent")],
+        [InlineKeyboardButton(text="💬 Ответил", callback_data="bulkstatus:replied")],
+        [InlineKeyboardButton(text="🔥 Интерес", callback_data="bulkstatus:interest")],
+        [InlineKeyboardButton(text="🤝 Клиент", callback_data="bulkstatus:client")],
+        [InlineKeyboardButton(text="❌ Отказ", callback_data="bulkstatus:reject")],
+        [InlineKeyboardButton(text="🚫 Бан", callback_data="bulkstatus:ban")],
+        [InlineKeyboardButton(text="🗑 Удалено", callback_data="bulkstatus:deleted")],
+        [InlineKeyboardButton(text="📦 Архив", callback_data="bulkstatus:archive")],
+    ])
 
 
 def build_pagination_kb(page: int, total_pages: int, window: int = 1) -> Optional[InlineKeyboardMarkup]:
@@ -225,6 +242,49 @@ def extract_usernames(text_value: str) -> list[str]:
     return result
 
 
+def parse_position_selector(text_value: str) -> Optional[list[int]]:
+    """Разбирает выбор лидов по номерам: "5", "5-20" или "5, 7, 10". Возвращает None при мусоре."""
+    text_value = text_value.strip()
+    if not text_value:
+        return None
+
+    range_match = RANGE_RE.match(text_value)
+    if range_match:
+        start, end = int(range_match.group(1)), int(range_match.group(2))
+        if start > end:
+            start, end = end, start
+        return list(range(start, end + 1))
+
+    single_match = SINGLE_NUM_RE.match(text_value)
+    if single_match:
+        return [int(single_match.group(1))]
+
+    parts = [p.strip() for p in text_value.split(",")]
+    parts = [p for p in parts if p]
+    if parts and all(p.isdigit() for p in parts):
+        return sorted({int(p) for p in parts})
+
+    return None
+
+
+def parse_date_input(text_value: str) -> Optional[dt.datetime]:
+    """Разбирает дату для /change_date: 28.09 / 28.09.2026 / 28.09 14:00."""
+    match = DATE_INPUT_RE.match(text_value.strip())
+    if not match:
+        return None
+    day, month, year, hour, minute = match.groups()
+    try:
+        return dt.datetime(
+            int(year) if year else db.moscow_now().year,
+            int(month),
+            int(day),
+            int(hour) if hour else 9,
+            int(minute) if minute else 0,
+        )
+    except ValueError:
+        return None
+
+
 def fmt_date(value) -> str:
     return value.strftime("%d.%m.%Y") if value else "—"
 
@@ -282,6 +342,24 @@ def lead_list_block(i: int, lead: db.Lead) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Общий флоу выбора лидов по номерам (используется /msg_leads, /change_status, /change_date)
+# ---------------------------------------------------------------------------
+
+async def resolve_leads_selector(message: Message, state: FSMContext, text_value: str) -> Optional[list[db.Lead]]:
+    """Разбирает ввод, находит лидов. При ошибке/пустом результате сама отвечает и чистит state. None — если дальше двигаться нельзя."""
+    positions = parse_position_selector(text_value)
+    if positions is None:
+        await message.answer("Не понял формат. Примеры: 5   5-20   5, 7, 10")
+        return None
+    leads = await db.get_leads_by_positions(positions)
+    if not leads:
+        await message.answer("Лидов с такими номерами не нашлось.", reply_markup=main_menu_kb())
+        await state.clear()
+        return None
+    return leads
+
+
+# ---------------------------------------------------------------------------
 # Общий флоу выбора сообщения (используется и в "Новые лиды", и в /msg_leads)
 # ---------------------------------------------------------------------------
 
@@ -318,18 +396,17 @@ async def apply_chosen_message(target: Message, state: FSMContext, message_label
 
     if purpose == "msg_leads":
         usernames = data.get("usernames") or []
+        selector_text = data.get("selector_text", "")
         await state.update_data(usernames=usernames, message_label=message_label)
         await state.set_state(Form.msg_leads_confirm)
         text_lines = [
             "⚠️ Проверьте данные",
-            f"Лиды: {data.get('range_start')}–{data.get('range_end')}",
+            f"Лиды: {selector_text}",
             f"Количество: {len(usernames)}",
             "Сообщение:",
             f"«{message_label}»",
-            "Статус:",
-            "🟡 Отправлено",
-            "Время:",
-            fmt_datetime(db.moscow_now()),
+            "",
+            "Статус и дата отправки НЕ меняются — только текст сообщения.",
             "Продолжить?",
         ]
         await target.answer("\n".join(text_lines), reply_markup=confirm_kb("msg_leads_apply"))
@@ -385,8 +462,13 @@ async def cmd_help(message: Message) -> None:
         "🔎 Найти лида — карточка, смена статуса, отметка FU, заметка\n"
         "📊 Статистика (/stats) — общая сводка + по конкретному сообщению\n"
         "📅 Follow-up (/followup) — кому сегодня FU1/FU2\n"
-        "📋 Показать всю базу — постранично; /5 откроет лида №5\n"
-        "/msg_leads — массово отметить диапазон лидов отправленными\n"
+        "📋 Показать всю базу — постранично; /5 откроет лида №5\n\n"
+        "/msg_leads — присвоить лидам текст сообщения (статус и дата НЕ меняются)\n"
+        "/change_status — массово сменить статус (5 / 5-20 / 5, 7, 10)\n"
+        "/change_date — массово поменять дату первой отправки (пересчитает FU1/FU2, статус не тронет)\n"
+        "/note текст — сохранить заметку по улучшению бота\n"
+        "/get_notes — показать все такие заметки\n"
+        "/del_notes — удалить все такие заметки (с подтверждением)\n"
         "/del@username — удалить лида навсегда (с подтверждением)\n"
         "/clear_db — полностью очистить базу (с подтверждением)\n\n"
         "Быстрая смена статуса: @username интерес / ответил / клиент / отказ / бан / удалено / архив",
@@ -591,7 +673,7 @@ async def cb_mark_fu2(callback: CallbackQuery) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Заметка
+# Заметка лида
 # ---------------------------------------------------------------------------
 
 @router.callback_query(F.data.startswith("note:"))
@@ -678,37 +760,23 @@ async def cb_confirm_followup(callback: CallbackQuery) -> None:
 
 
 # ---------------------------------------------------------------------------
-# /msg_leads — массовая отметка диапазона отправленными
+# /msg_leads — присвоить сообщение группе лидов (статус и дата НЕ меняются)
 # ---------------------------------------------------------------------------
 
 @router.message(Command("msg_leads"))
 async def cmd_msg_leads(message: Message, state: FSMContext) -> None:
     await state.set_state(Form.msg_leads_range)
-    await message.answer("Каких лидов отметить?\nНапример:\n1-30")
+    await message.answer("Каких лидов отметить?\nПримеры: 5   5-20   5, 7, 10")
 
 
 @router.message(Form.msg_leads_range)
 async def msg_leads_range_input(message: Message, state: FSMContext) -> None:
     text_value = (message.text or "").strip()
-    range_match = RANGE_RE.match(text_value)
-    single_match = SINGLE_NUM_RE.match(text_value)
-
-    if range_match:
-        start, end = int(range_match.group(1)), int(range_match.group(2))
-    elif single_match:
-        start = end = int(single_match.group(1))
-    else:
-        await message.answer("Не понял диапазон. Пример: 1-30")
+    leads = await resolve_leads_selector(message, state, text_value)
+    if leads is None:
         return
-
-    leads = await db.get_leads_by_position_range(start, end)
-    if not leads:
-        await message.answer("Лидов с такими номерами не нашлось.", reply_markup=main_menu_kb())
-        await state.clear()
-        return
-
     usernames = [l.username for l in leads]
-    await state.update_data(usernames=usernames, range_start=start, range_end=start + len(usernames) - 1)
+    await state.update_data(usernames=usernames, selector_text=text_value)
     await prompt_choose_message(message, state, purpose="msg_leads")
 
 
@@ -722,8 +790,140 @@ async def cb_confirm_msg_leads(callback: CallbackQuery, state: FSMContext) -> No
     if not usernames or not message_label:
         await callback.answer("Данные устарели, начни заново.", show_alert=True)
         return
-    count = await db.assign_message_and_send(usernames, message_label)
-    await callback.message.answer(f"✅ Отмечено отправленными: {count}\nСообщение: «{message_label}»")
+    count = await db.assign_message_only(usernames, message_label)
+    await callback.message.answer(f"✅ Сообщение присвоено {count} лидам: «{message_label}»")
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# /change_status — массовая смена статуса
+# ---------------------------------------------------------------------------
+
+@router.message(Command("change_status"))
+async def cmd_change_status(message: Message, state: FSMContext) -> None:
+    await state.set_state(Form.change_status_selector)
+    await message.answer("Каких лидов изменить?\nПримеры: 5   5-20   5, 7, 10")
+
+
+@router.message(Form.change_status_selector)
+async def change_status_selector_input(message: Message, state: FSMContext) -> None:
+    text_value = (message.text or "").strip()
+    leads = await resolve_leads_selector(message, state, text_value)
+    if leads is None:
+        return
+    usernames = [l.username for l in leads]
+    await state.clear()  # выбор статуса дальше идёт через callback, отдельное состояние не нужно
+    await state.update_data(usernames=usernames)
+    await message.answer(f"Выбрано лидов: {len(usernames)}\nНовый статус:", reply_markup=bulk_status_kb())
+
+
+@router.callback_query(F.data.startswith("bulkstatus:"))
+async def cb_bulk_status(callback: CallbackQuery, state: FSMContext) -> None:
+    code = callback.data.split(":", 1)[1]
+    status = db.STATUS_BY_CODE.get(code)
+    if not status:
+        await callback.answer("Неизвестный статус", show_alert=True)
+        return
+    data = await state.get_data()
+    usernames = data.get("usernames") or []
+    await state.clear()
+    if not usernames:
+        await callback.answer("Данные устарели, начни заново.", show_alert=True)
+        return
+    count = await db.set_status_bulk(usernames, status)
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(f"✅ Статус изменён у {count} лидов: {status}")
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# /change_date — массовая смена даты первой отправки (статус НЕ меняется)
+# ---------------------------------------------------------------------------
+
+@router.message(Command("change_date"))
+async def cmd_change_date(message: Message, state: FSMContext) -> None:
+    await state.set_state(Form.change_date_selector)
+    await message.answer("Каких лидов изменить?\nПримеры: 5   5-20   5, 7, 10")
+
+
+@router.message(Form.change_date_selector)
+async def change_date_selector_input(message: Message, state: FSMContext) -> None:
+    text_value = (message.text or "").strip()
+    leads = await resolve_leads_selector(message, state, text_value)
+    if leads is None:
+        return
+    usernames = [l.username for l in leads]
+    await state.update_data(usernames=usernames)
+    await state.set_state(Form.change_date_value)
+    await message.answer(
+        f"Выбрано лидов: {len(usernames)}\n"
+        "Новая дата первой отправки?\n"
+        "Формат: 28.09, 28.09.2026 или 28.09 14:00\n"
+        "FU1 и FU2 пересчитаются автоматически, статус не меняется."
+    )
+
+
+@router.message(Form.change_date_value)
+async def change_date_value_input(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    usernames = data.get("usernames") or []
+    await state.clear()
+    if not usernames:
+        await message.answer("Данные устарели, начни заново.", reply_markup=main_menu_kb())
+        return
+    new_date = parse_date_input((message.text or "").strip())
+    if new_date is None:
+        await message.answer("Не понял дату. Формат: 28.09, 28.09.2026 или 28.09 14:00.")
+        return
+    count = await db.change_message_date_bulk(usernames, new_date)
+    fu1_due = new_date + dt.timedelta(days=4)
+    fu2_due = fu1_due + dt.timedelta(days=7)
+    await message.answer(
+        f"✅ Дата отправки обновлена у {count} лидов: {fmt_datetime(new_date)}\n"
+        f"FU1: {fmt_date(fu1_due)} | FU2: {fmt_date(fu2_due)}",
+        reply_markup=main_menu_kb(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# /note, /get_notes, /del_notes — заметки по улучшению бота (не про лидов)
+# ---------------------------------------------------------------------------
+
+@router.message(Command("note"))
+async def cmd_note(message: Message, command: CommandObject) -> None:
+    text_value = (command.args or "").strip()
+    if not text_value:
+        await message.answer("Использование: /note текст заметки")
+        return
+    await db.add_improvement_note(text_value)
+    await message.answer("📝 Заметка по улучшению сохранена.")
+
+
+@router.message(Command("get_notes"))
+async def cmd_get_notes(message: Message) -> None:
+    notes = await db.get_improvement_notes()
+    if not notes:
+        await message.answer("Заметок по улучшению пока нет.")
+        return
+    lines = ["📝 ЗАМЕТКИ ПО УЛУЧШЕНИЮ"]
+    for i, n in enumerate(notes, start=1):
+        lines.append(f"{i}. {n.text}")
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("del_notes"))
+async def cmd_del_notes(message: Message) -> None:
+    await message.answer(
+        "⚠️ Удалить ВСЕ заметки по улучшению? Действие необратимо.",
+        reply_markup=confirm_kb("del_notes"),
+    )
+
+
+@router.callback_query(F.data == "confirm:del_notes")
+async def cb_confirm_del_notes(callback: CallbackQuery) -> None:
+    count = await db.clear_improvement_notes()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(f"🗑 Удалено заметок: {count}")
     await callback.answer()
 
 

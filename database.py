@@ -1,7 +1,7 @@
 """
 database.py — вся работа с базой данных (SQLite + SQLAlchemy 2.x async).
 
-Одна таблица: leads.
+Таблицы: leads, improvement_notes.
 Все функции — тонкие обёртки над простыми SQL-запросами через ORM.
 """
 
@@ -70,14 +70,13 @@ QUICK_STATUS_WORDS: dict[str, str] = {
 }
 
 # статусы, которые нельзя автоматически перевести в архив по правилу 14/7 дней
-# (архивация 14/7 дней касается только "🟡 Отправлено")
 ARCHIVE_ELIGIBLE_STATUS = STATUS_SENT
 
 # ---------------------------------------------------------------------------
 # Модель и подключение
 # ---------------------------------------------------------------------------
 
-DB_PATH = "data/leads.db"
+DB_PATH = "leads.db"
 engine = create_async_engine(f"sqlite+aiosqlite:///{DB_PATH}")
 async_session = async_sessionmaker(engine, expire_on_commit=False)
 
@@ -94,30 +93,30 @@ class Lead(Base):
     status: Mapped[str] = mapped_column(String, default=STATUS_NEW)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
 
-    # какое именно сообщение отправлено этому лиду (текст варианта рассылки)
     message: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-
-    # фактическое время первого сообщения
     message_sent_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime, nullable=True)
 
-    # запланированная / фактическая дата FU1
     fu1_due_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime, nullable=True)
     fu1_sent_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime, nullable=True)
 
-    # запланированная / фактическая дата FU2
     fu2_due_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime, nullable=True)
     fu2_sent_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime, nullable=True)
 
-    # после какого касания лид ответил: initial / fu1 / fu2
     response_stage: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-
     note: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
 
+class ImprovementNote(Base):
+    """Заметки по улучшению бота/процесса — не связаны с лидами."""
+    __tablename__ = "improvement_notes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    text: Mapped[str] = mapped_column(String)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+
+
 async def _ensure_schema_migrations() -> None:
-    """Лёгкая миграция для уже существующей базы (старые sent_at/follow_up_*_at -> новые поля).
-    Ничего не удаляет и не выдумывает: только добавляет отсутствующие колонки и переносит
-    то, что реально было (message_sent_at <- sent_at, fu*_due_at <- follow_up_*_at)."""
+    """Лёгкая миграция для уже существующей базы. Ничего не удаляет и не выдумывает."""
     async with engine.begin() as conn:
         result = await conn.execute(text("PRAGMA table_info(leads)"))
         cols = {row[1] for row in result.fetchall()}
@@ -183,7 +182,6 @@ async def add_leads(usernames: list[str]) -> tuple[list[str], list[str]]:
 # ---------------------------------------------------------------------------
 
 async def clear_all_leads() -> int:
-    """Полностью удаляет всех лидов из базы. Возвращает, сколько было удалено."""
     async with async_session() as session:
         count = await session.scalar(select(func.count(Lead.id))) or 0
         await session.execute(delete(Lead))
@@ -192,7 +190,6 @@ async def clear_all_leads() -> int:
 
 
 async def delete_lead(username: str) -> bool:
-    """Удаляет одного лида НАВСЕГДА (физически из БД)."""
     async with async_session() as session:
         lead = await session.scalar(select(Lead).where(Lead.username == username))
         if not lead:
@@ -203,7 +200,7 @@ async def delete_lead(username: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Постраничный просмотр (пагинация не меняется — только источник данных)
+# Постраничный просмотр / выбор по позициям (пагинация не меняется)
 # ---------------------------------------------------------------------------
 
 async def count_leads() -> int:
@@ -212,7 +209,6 @@ async def count_leads() -> int:
 
 
 async def get_leads_page(offset: int, limit: int) -> list[Lead]:
-    """Один "чанк" лидов по id ASC — без загрузки всей базы в память."""
     async with async_session() as session:
         result = await session.scalars(
             select(Lead).order_by(Lead.id.asc()).offset(offset).limit(limit)
@@ -220,26 +216,24 @@ async def get_leads_page(offset: int, limit: int) -> list[Lead]:
         return list(result.all())
 
 
-async def get_leads_by_position_range(start: int, end: int) -> list[Lead]:
-    """Лиды с позициями start..end включительно (тот же порядок id ASC, что и в пагинации)."""
-    if start > end:
-        start, end = end, start
-    start = max(1, start)
-    offset = start - 1
-    limit = end - start + 1
-    if limit <= 0:
-        return []
-    return await get_leads_page(offset, limit)
-
-
 async def get_lead_by_position(position: int) -> Optional[Lead]:
-    """Лид по сквозному номеру (1-based, тот же порядок id ASC, что и в пагинации)."""
+    """Лид по сквозному номеру (1-based, порядок id ASC — тот же, что и в пагинации)."""
     if position < 1:
         return None
     async with async_session() as session:
         return await session.scalar(
             select(Lead).order_by(Lead.id.asc()).offset(position - 1).limit(1)
         )
+
+
+async def get_leads_by_positions(positions: list[int]) -> list[Lead]:
+    """Лиды по произвольному списку сквозных номеров (используется /msg_leads, /change_status, /change_date)."""
+    leads: list[Lead] = []
+    for p in positions:
+        lead = await get_lead_by_position(p)
+        if lead:
+            leads.append(lead)
+    return leads
 
 
 async def get_new_leads(limit: int) -> list[Lead]:
@@ -254,11 +248,11 @@ async def get_new_leads(limit: int) -> list[Lead]:
 
 
 # ---------------------------------------------------------------------------
-# Отправка сообщения (первого касания)
+# Отправка сообщения (первое касание — "Новые лиды" -> "Отметить отправленными")
 # ---------------------------------------------------------------------------
 
 async def assign_message_and_send(usernames: list[str], message: str) -> int:
-    """Переводит лидов в 🟡 Отправлено, назначает сообщение и обнуляет FU-цикл (новый старт)."""
+    """Переводит лидов в 🟡 Отправлено, назначает сообщение, ставит дату и обнуляет FU-цикл."""
     if not usernames:
         return 0
     now = moscow_now()
@@ -279,12 +273,72 @@ async def assign_message_and_send(usernames: list[str], message: str) -> int:
         return len(leads)
 
 
+async def assign_message_only(usernames: list[str], message: str) -> int:
+    """/msg_leads: только присваивает текст сообщения. Статус и дата отправки НЕ меняются."""
+    if not usernames:
+        return 0
+    async with async_session() as session:
+        result = await session.scalars(select(Lead).where(Lead.username.in_(usernames)))
+        leads = list(result.all())
+        for lead in leads:
+            lead.message = message
+        await session.commit()
+        return len(leads)
+
+
+# ---------------------------------------------------------------------------
+# Массовое изменение статуса (/change_status)
+# ---------------------------------------------------------------------------
+
+async def set_status_bulk(usernames: list[str], status: str) -> int:
+    """Меняет статус группе лидов. Если новый статус — 🟡 Отправлено, дата отправки = сейчас."""
+    if not usernames:
+        return 0
+    now = moscow_now()
+    async with async_session() as session:
+        result = await session.scalars(select(Lead).where(Lead.username.in_(usernames)))
+        leads = list(result.all())
+        for lead in leads:
+            lead.status = status
+            if status == STATUS_SENT:
+                lead.message_sent_at = now
+            if status == STATUS_REPLIED:
+                if lead.fu2_sent_at:
+                    lead.response_stage = "fu2"
+                elif lead.fu1_sent_at:
+                    lead.response_stage = "fu1"
+                else:
+                    lead.response_stage = "initial"
+        await session.commit()
+        return len(leads)
+
+
+# ---------------------------------------------------------------------------
+# Массовое изменение даты первой отправки (/change_date) — статус НЕ меняется
+# ---------------------------------------------------------------------------
+
+async def change_message_date_bulk(usernames: list[str], new_date: dt.datetime) -> int:
+    """Меняет message_sent_at и пересчитывает fu1_due_at / fu2_due_at. Статус не трогает."""
+    if not usernames:
+        return 0
+    fu1_due = new_date + dt.timedelta(days=4)
+    fu2_due = fu1_due + dt.timedelta(days=7)
+    async with async_session() as session:
+        result = await session.scalars(select(Lead).where(Lead.username.in_(usernames)))
+        leads = list(result.all())
+        for lead in leads:
+            lead.message_sent_at = new_date
+            lead.fu1_due_at = fu1_due
+            lead.fu2_due_at = fu2_due
+        await session.commit()
+        return len(leads)
+
+
 # ---------------------------------------------------------------------------
 # Библиотека сообщений (отдельной таблицы нет — берём из уже использованных)
 # ---------------------------------------------------------------------------
 
 async def get_recent_messages(limit: int = 4) -> list[str]:
-    """Последние уникальные варианты сообщения, по свежести фактического использования."""
     async with async_session() as session:
         result = await session.scalars(
             select(Lead.message)
@@ -302,7 +356,6 @@ async def get_recent_messages(limit: int = 4) -> list[str]:
 
 
 async def get_all_messages() -> list[str]:
-    """Все уникальные варианты сообщения, от самого свежего к самому старому."""
     return await get_recent_messages(limit=10**6)
 
 
@@ -347,7 +400,6 @@ async def set_note(username: str, note: str) -> bool:
 # ---------------------------------------------------------------------------
 
 async def mark_fu1_batch(usernames: list[str]) -> int:
-    """fu1_sent_at = сейчас; fu2_due_at = fu1_sent_at + 7 дней (отсчёт от факта, не от плана)."""
     if not usernames:
         return 0
     now = moscow_now()
@@ -362,7 +414,6 @@ async def mark_fu1_batch(usernames: list[str]) -> int:
 
 
 async def mark_fu2_batch(usernames: list[str]) -> int:
-    """fu2_sent_at = сейчас. Новый FU больше не планируется."""
     if not usernames:
         return 0
     now = moscow_now()
@@ -376,7 +427,6 @@ async def mark_fu2_batch(usernames: list[str]) -> int:
 
 
 async def get_followups_due() -> tuple[list[Lead], list[Lead]]:
-    """Лиды, у которых FU1 (или FU2) должны быть отправлены сегодня или раньше."""
     today = moscow_now().date()
     async with async_session() as session:
         result = await session.scalars(select(Lead).where(Lead.status == STATUS_SENT))
@@ -398,7 +448,6 @@ async def get_followups_due() -> tuple[list[Lead], list[Lead]]:
 # ---------------------------------------------------------------------------
 
 async def auto_archive_check() -> int:
-    """Переводит в 📦 Архив просроченные 🟡 Отправлено. Идемпотентно, безопасно вызывать часто."""
     now = moscow_now()
     archived = 0
     async with async_session() as session:
@@ -436,7 +485,6 @@ async def get_stats() -> dict:
 
 
 async def get_message_stats(message: str) -> dict:
-    """Статистика по конкретному варианту сообщения: сколько отправлено и как распределились статусы."""
     async with async_session() as session:
         total = await session.scalar(
             select(func.count(Lead.id)).where(Lead.message == message)
@@ -448,3 +496,29 @@ async def get_message_stats(message: str) -> dict:
             )
             by_status[status] = count or 0
     return {"total": total, "by_status": by_status}
+
+
+# ---------------------------------------------------------------------------
+# Заметки по улучшению (/note, /get_notes, /del_notes) — не про лидов
+# ---------------------------------------------------------------------------
+
+async def add_improvement_note(text_value: str) -> None:
+    async with async_session() as session:
+        session.add(ImprovementNote(text=text_value))
+        await session.commit()
+
+
+async def get_improvement_notes() -> list[ImprovementNote]:
+    async with async_session() as session:
+        result = await session.scalars(
+            select(ImprovementNote).order_by(ImprovementNote.created_at.asc())
+        )
+        return list(result.all())
+
+
+async def clear_improvement_notes() -> int:
+    async with async_session() as session:
+        count = await session.scalar(select(func.count(ImprovementNote.id))) or 0
+        await session.execute(delete(ImprovementNote))
+        await session.commit()
+        return count
