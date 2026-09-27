@@ -76,7 +76,7 @@ ARCHIVE_ELIGIBLE_STATUS = STATUS_SENT
 # Модель и подключение
 # ---------------------------------------------------------------------------
 
-DB_PATH = "data/leads.db"
+DB_PATH = "leads.db"
 engine = create_async_engine(f"sqlite+aiosqlite:///{DB_PATH}")
 async_session = async_sessionmaker(engine, expire_on_commit=False)
 
@@ -98,9 +98,11 @@ class Lead(Base):
 
     fu1_due_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime, nullable=True)
     fu1_sent_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime, nullable=True)
+    fu1_message: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
     fu2_due_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime, nullable=True)
     fu2_sent_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime, nullable=True)
+    fu2_message: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
     response_stage: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     note: Mapped[Optional[str]] = mapped_column(String, nullable=True)
@@ -126,8 +128,10 @@ async def _ensure_schema_migrations() -> None:
             "message_sent_at": "DATETIME",
             "fu1_due_at": "DATETIME",
             "fu1_sent_at": "DATETIME",
+            "fu1_message": "VARCHAR",
             "fu2_due_at": "DATETIME",
             "fu2_sent_at": "DATETIME",
+            "fu2_message": "VARCHAR",
             "response_stage": "VARCHAR",
         }
         for name, coltype in new_columns.items():
@@ -359,6 +363,36 @@ async def get_all_messages() -> list[str]:
     return await get_recent_messages(limit=10**6)
 
 
+async def get_recent_fu_messages(stage: str, limit: int = 4) -> list[str]:
+    """Последние уникальные варианты FU1- или FU2-сообщения (отдельная библиотека от первого сообщения)."""
+    column = Lead.fu1_message if stage == "fu1" else Lead.fu2_message
+    async with async_session() as session:
+        result = await session.scalars(
+            select(column).where(column.is_not(None)).order_by(Lead.id.desc()).limit(200)
+        )
+        seen: list[str] = []
+        for msg in result.all():
+            if msg and msg not in seen:
+                seen.append(msg)
+            if len(seen) >= limit:
+                break
+        return seen
+
+
+async def assign_fu_message(usernames: list[str], stage: str, message: str) -> int:
+    """Присваивает текст FU1- или FU2-сообщения группе лидов. Статус, даты и FU-отметки НЕ меняются."""
+    if not usernames:
+        return 0
+    field = "fu1_message" if stage == "fu1" else "fu2_message"
+    async with async_session() as session:
+        result = await session.scalars(select(Lead).where(Lead.username.in_(usernames)))
+        leads = list(result.all())
+        for lead in leads:
+            setattr(lead, field, message)
+        await session.commit()
+        return len(leads)
+
+
 # ---------------------------------------------------------------------------
 # Поиск / изменение одного лида
 # ---------------------------------------------------------------------------
@@ -522,7 +556,3 @@ async def clear_improvement_notes() -> int:
         await session.execute(delete(ImprovementNote))
         await session.commit()
         return count
-
-
-
-#sosite
