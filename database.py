@@ -200,6 +200,19 @@ async def set_note(username: str, note: str) -> bool:
         return True
 
 
+async def set_followup(username: str, field: str, value: Optional[dt.datetime]) -> bool:
+    """Вручную меняет follow_up_1_at или follow_up_2_at (value=None — убрать дату)."""
+    if field not in ("follow_up_1_at", "follow_up_2_at"):
+        raise ValueError(f"Неизвестное поле: {field}")
+    async with async_session() as session:
+        lead = await session.scalar(select(Lead).where(Lead.username == username))
+        if not lead:
+            return False
+        setattr(lead, field, value)
+        await session.commit()
+        return True
+
+
 # ---------------------------------------------------------------------------
 # Follow-up
 # ---------------------------------------------------------------------------

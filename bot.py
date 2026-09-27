@@ -8,6 +8,7 @@ bot.py — Telegram-бот для ведения базы лидов (ручны
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import logging
 import os
 import re
@@ -64,6 +65,7 @@ class Form(StatesGroup):
     new_leads_count = State()   # ждём число "сколько лидов показать"
     searching = State()         # ждём username для поиска
     adding_note = State()       # ждём текст заметки
+    setting_fu = State()        # ждём новую дату FU1/FU2
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +112,10 @@ def status_kb(username: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="❌ Отказ", callback_data=f"st:{username}:reject")],
         [InlineKeyboardButton(text="🚫 Бан", callback_data=f"st:{username}:ban")],
         [InlineKeyboardButton(text="📦 Архив", callback_data=f"st:{username}:archive")],
+        [
+            InlineKeyboardButton(text="📅 FU1", callback_data=f"setfu:fu1:{username}"),
+            InlineKeyboardButton(text="📅 FU2", callback_data=f"setfu:fu2:{username}"),
+        ],
         [InlineKeyboardButton(text="📝 Заметка", callback_data=f"note:{username}")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -185,6 +191,7 @@ def lead_card_text(lead: db.Lead) -> str:
         f"Статус: {lead.status}\n"
         f"Добавлен: {fmt_date(lead.created_at)}\n"
         f"Отправлен: {fmt_date(lead.sent_at)}\n"
+        f"FU1: {fmt_date(lead.follow_up_1_at)} | FU2: {fmt_date(lead.follow_up_2_at)}\n"
         f"Заметка:\n{lead.note or '—'}"
     )
 
@@ -210,7 +217,7 @@ async def cmd_help(message: Message) -> None:
     await message.answer(
         "📥 Добавить лидов — пришли список @username\n"
         "📋 Новые лиды — выдать пачку ещё не отправленных\n"
-        "🔎 Найти лида — посмотреть карточку и сменить статус\n"
+        "🔎 Найти лида — посмотреть карточку, сменить статус, поменять FU1/FU2 или заметку\n"
         "📊 Статистика — сводка по базе\n"
         "📅 Follow-up — кому сегодня писать повторно\n"
         "📋 Показать всю базу — постранично, с кнопками пролистывания; /5 откроет лида №5\n"
@@ -352,10 +359,9 @@ async def cb_set_status(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "confirm:clear_db")
 async def cb_confirm_clear_db(callback: CallbackQuery) -> None:
-    global last_batch, all_leads_index
+    global last_batch
     count = await db.clear_all_leads()
     last_batch = []
-    all_leads_index = []
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.answer(f"🗑 База очищена. Удалено лидов: {count}")
     await callback.answer()
@@ -390,6 +396,79 @@ async def note_save(message: Message, state: FSMContext) -> None:
         return
     await db.set_note(username, message.text or "")
     await message.answer(f"📝 Заметка для @{username} сохранена.", reply_markup=main_menu_kb())
+
+
+# ---------------------------------------------------------------------------
+# Ручное изменение FU1 / FU2 у отдельного лида
+# ---------------------------------------------------------------------------
+
+FU_DATE_RE = re.compile(
+    r"^(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?(?:\s+(\d{1,2}):(\d{2}))?$"
+)
+FU_CLEAR_WORDS = {"-", "нет", "убрать", "очистить"}
+
+
+@router.callback_query(F.data.startswith("setfu:"))
+async def cb_set_fu_start(callback: CallbackQuery, state: FSMContext) -> None:
+    _, field, username = callback.data.split(":", 2)
+    label = "FU1" if field == "fu1" else "FU2"
+    await state.set_state(Form.setting_fu)
+    await state.update_data(username=username, field=field)
+    await callback.message.answer(
+        f"Новая дата {label} для @{username}?\n"
+        "Формат: 28.09 или 28.09.2026, можно с временем: 28.09 14:00\n"
+        "Чтобы убрать дату — пришли «-»"
+    )
+    await callback.answer()
+
+
+@router.message(Form.setting_fu)
+async def set_fu_input(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    username = data.get("username")
+    field = data.get("field")
+    await state.clear()
+    if not username or not field:
+        await message.answer("Что-то пошло не так, попробуй заново.", reply_markup=main_menu_kb())
+        return
+
+    db_field = "follow_up_1_at" if field == "fu1" else "follow_up_2_at"
+    label = "FU1" if field == "fu1" else "FU2"
+    text = (message.text or "").strip()
+
+    if text.lower() in FU_CLEAR_WORDS:
+        value: Optional[dt.datetime] = None
+    else:
+        match = FU_DATE_RE.match(text)
+        if not match:
+            await message.answer(
+                "Не понял дату. Формат: 28.09, 28.09.2026 или 28.09 14:00 (либо «-», чтобы убрать)."
+            )
+            return
+        day, month, year, hour, minute = match.groups()
+        try:
+            value = dt.datetime(
+                int(year) if year else dt.datetime.utcnow().year,
+                int(month),
+                int(day),
+                int(hour) if hour else 9,
+                int(minute) if minute else 0,
+            )
+        except ValueError:
+            await message.answer("Некорректная дата, попробуй ещё раз.")
+            return
+
+    ok = await db.set_followup(username, db_field, value)
+    if not ok:
+        await message.answer(f"⚠️ @{username} не найден в базе.", reply_markup=main_menu_kb())
+        return
+
+    shown = value.strftime("%d.%m.%Y %H:%M") if value else "убрана"
+    await message.answer(f"{label} для @{username}: {shown}")
+
+    lead = await db.find_lead(username)
+    if lead:
+        await message.answer(lead_card_text(lead), reply_markup=status_kb(lead.username))
 
 
 # ---------------------------------------------------------------------------
