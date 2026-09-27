@@ -76,7 +76,7 @@ ARCHIVE_ELIGIBLE_STATUS = STATUS_SENT
 # Модель и подключение
 # ---------------------------------------------------------------------------
 
-DB_PATH = "leads.db"
+DB_PATH = "data/leads.db" 
 engine = create_async_engine(f"sqlite+aiosqlite:///{DB_PATH}")
 async_session = async_sessionmaker(engine, expire_on_commit=False)
 
@@ -556,3 +556,7 @@ async def clear_improvement_notes() -> int:
         await session.execute(delete(ImprovementNote))
         await session.commit()
         return count
+
+
+
+#sosite
