@@ -11,6 +11,7 @@ import asyncio
 import logging
 import os
 import re
+from typing import Optional
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -51,8 +52,8 @@ USERNAME_RE = re.compile(r"@?([A-Za-z0-9_]{5,32})")
 # "последняя выданная пачка" — храним в памяти процесса, как договорились (V1)
 last_batch: list[str] = []
 
-# номер (при показе "вся база") -> username, для команд вида /5
-all_leads_index: list[str] = []
+# размер "страницы" при постраничном просмотре всей базы
+LEADS_PER_PAGE = 10
 
 
 # ---------------------------------------------------------------------------
@@ -108,11 +109,42 @@ def status_kb(username: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🤝 Клиент", callback_data=f"st:{username}:client")],
         [InlineKeyboardButton(text="❌ Отказ", callback_data=f"st:{username}:reject")],
         [InlineKeyboardButton(text="🚫 Бан", callback_data=f"st:{username}:ban")],
-        [InlineKeyboardButton(text="🗑 Удалено", callback_data=f"st:{username}:deleted")],
         [InlineKeyboardButton(text="📦 Архив", callback_data=f"st:{username}:archive")],
         [InlineKeyboardButton(text="📝 Заметка", callback_data=f"note:{username}")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_pagination_kb(page: int, total_pages: int, window: int = 1) -> Optional[InlineKeyboardMarkup]:
+    """Компактная пагинация: ⏪ 1 2 … 10 ⏩ (макс. 5 кнопок-цифр; без ⏪/⏩ на краях, без кнопок, если страница одна)."""
+    if total_pages <= 1:
+        return None
+
+    # какие номера страниц показывать целиком, остальное — многоточие
+    keep = {1, total_pages}
+    for p in range(page - window, page + window + 1):
+        if 1 <= p <= total_pages:
+            keep.add(p)
+    ordered = sorted(keep)
+
+    buttons: list[InlineKeyboardButton] = []
+    if page > 1:
+        buttons.append(InlineKeyboardButton(text="⏪", callback_data=f"leads_page:{page - 1}"))
+
+    prev_shown: Optional[int] = None
+    for p in ordered:
+        if prev_shown is not None and p - prev_shown > 1:
+            buttons.append(InlineKeyboardButton(text="…", callback_data="noop"))
+        if p == page:
+            buttons.append(InlineKeyboardButton(text=f"·{p}·", callback_data="noop"))
+        else:
+            buttons.append(InlineKeyboardButton(text=str(p), callback_data=f"leads_page:{p}"))
+        prev_shown = p
+
+    if page < total_pages:
+        buttons.append(InlineKeyboardButton(text="⏩", callback_data=f"leads_page:{page + 1}"))
+
+    return InlineKeyboardMarkup(inline_keyboard=[buttons])
 
 
 def confirm_kb(action: str) -> InlineKeyboardMarkup:
@@ -181,9 +213,9 @@ async def cmd_help(message: Message) -> None:
         "🔎 Найти лида — посмотреть карточку и сменить статус\n"
         "📊 Статистика — сводка по базе\n"
         "📅 Follow-up — кому сегодня писать повторно\n"
-        "📋 Показать всю базу — вся база целиком, пронумерованная (/5 откроет лида №5)\n"
+        "📋 Показать всю базу — постранично, с кнопками пролистывания; /5 откроет лида №5\n"
         "/clear_db — полностью очистить базу (с подтверждением)\n\n"
-        "Быстрая смена статуса: @username интерес / ответил / клиент / отказ / бан / удалено / архив",
+        "Быстрая смена статуса: @username интерес / ответил / клиент / отказ / бан / архив",
         reply_markup=main_menu_kb(),
     )
 
@@ -308,15 +340,6 @@ async def cb_set_status(callback: CallbackQuery) -> None:
         await callback.answer("Неизвестный статус", show_alert=True)
         return
 
-    # массовое/безвозвратное действие — просим подтверждение
-    if code == "deleted":
-        await callback.message.answer(
-            f"⚠️ Пометить @{username} как удалённый?",
-            reply_markup=confirm_kb(f"del:{username}"),
-        )
-        await callback.answer()
-        return
-
     ok = await db.set_status(username, status)
     if ok:
         await callback.answer(f"Статус изменён: {status}")
@@ -325,15 +348,6 @@ async def cb_set_status(callback: CallbackQuery) -> None:
             await callback.message.edit_text(lead_card_text(lead), reply_markup=status_kb(username))
     else:
         await callback.answer("Лид не найден", show_alert=True)
-
-
-@router.callback_query(F.data.startswith("confirm:del:"))
-async def cb_confirm_delete(callback: CallbackQuery) -> None:
-    username = callback.data.split(":", 2)[2]
-    await db.set_status(username, db.STATUS_DELETED)
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer(f"🗑 @{username} помечен как удалённый.")
-    await callback.answer()
 
 
 @router.callback_query(F.data == "confirm:clear_db")
@@ -414,48 +428,66 @@ async def stats(message: Message) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 📋 Показать всю базу
+# 📋 Показать всю базу (постранично, с редактированием сообщения)
 # ---------------------------------------------------------------------------
 
+def lead_list_block(i: int, lead: db.Lead) -> str:
+    """Компактный блок одного лида в постраничном списке (с номером, статусом, датами и заметкой)."""
+    return (
+        f"{i}. @{lead.username} — {lead.status}\n"
+        f"  Добавлен: {fmt_date(lead.created_at)} | Отправлен: {fmt_date(lead.sent_at)}\n"
+        f"  FU1: {fmt_date(lead.follow_up_1_at)} | FU2: {fmt_date(lead.follow_up_2_at)}\n"
+        f"  Заметка: {lead.note or '—'}"
+    )
+
+
+async def render_leads_page(page: int) -> tuple[str, Optional[InlineKeyboardMarkup]]:
+    """Собирает текст и клавиатуру для страницы `page` (1-based). Ничего не отправляет."""
+    total = await db.count_leads()
+    if total == 0:
+        return "📋 <b>ВСЯ БАЗА</b>\nБаза пока пуста.\nДобавь первых лидов, чтобы они появились здесь.", None
+
+    total_pages = (total + LEADS_PER_PAGE - 1) // LEADS_PER_PAGE
+    page = max(1, min(page, total_pages))
+    offset = (page - 1) * LEADS_PER_PAGE
+
+    leads = await db.get_leads_page(offset, LEADS_PER_PAGE)
+    blocks = [lead_list_block(offset + i, lead) for i, lead in enumerate(leads, start=1)]
+
+    text = (
+        f"📋 <b>ВСЯ БАЗА</b>\n"
+        f"<b>Страница {page} из {total_pages}</b>\n"
+        f"Показано: {offset + 1}–{offset + len(leads)} из {total}\n\n"
+        + "\n\n".join(blocks)
+    )
+    return text, build_pagination_kb(page, total_pages)
+
+
 @router.message(F.text == "📋 Показать всю базу")
-async def show_all_leads(message: Message) -> None:
-    leads = await db.get_all_leads()
-    if not leads:
-        await message.answer("База пуста.", reply_markup=main_menu_kb())
-        return
+async def all_leads_show(message: Message) -> None:
+    text, kb = await render_leads_page(1)
+    await message.answer(text, reply_markup=kb or main_menu_kb())
 
-    global all_leads_index
-    all_leads_index = [lead.username for lead in leads]
 
-    lines = []
-    for i, lead in enumerate(leads, start=1):
-        lines.append(
-            f"{i}. @{lead.username} — {lead.status}\n"
-            f"  Добавлен: {fmt_date(lead.created_at)} | Отправлен: {fmt_date(lead.sent_at)}\n"
-            f"  FU1: {fmt_date(lead.follow_up_1_at)} | FU2: {fmt_date(lead.follow_up_2_at)}\n"
-            f"  Заметка: {lead.note or '—'}"
-        )
+@router.callback_query(F.data.startswith("leads_page:"))
+async def cb_leads_page(callback: CallbackQuery) -> None:
+    page = int(callback.data.split(":", 1)[1])
+    text, kb = await render_leads_page(page)
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
 
-    chunk = f"📋 Вся база — {len(leads)}\n(введи /номер, чтобы открыть лида, например /5)\n\n"
-    for block in lines:
-        if len(chunk) + len(block) > 3800:
-            await message.answer(chunk)
-            chunk = ""
-        chunk += block + "\n\n"
-    if chunk:
-        await message.answer(chunk, reply_markup=main_menu_kb())
+
+@router.callback_query(F.data == "noop")
+async def cb_noop(callback: CallbackQuery) -> None:
+    await callback.answer()
 
 
 @router.message(F.text.regexp(r"^/(\d+)$"))
 async def open_lead_by_number(message: Message) -> None:
     num = int(message.text[1:])
-    if num < 1 or num > len(all_leads_index):
-        await message.answer("⚠️ Такого номера нет. Сначала открой «📋 Показать всю базу».")
-        return
-    username = all_leads_index[num - 1]
-    lead = await db.find_lead(username)
+    lead = await db.get_lead_by_position(num)
     if not lead:
-        await message.answer(f"⚠️ @{username} не найден в базе.")
+        await message.answer("⚠️ Такого номера нет. Сначала открой «📋 Показать всю базу».")
         return
     await message.answer(lead_card_text(lead), reply_markup=status_kb(lead.username))
 
@@ -482,12 +514,6 @@ async def free_text(message: Message) -> None:
         lead = await db.find_lead(username)
         if not lead:
             await message.answer(f"⚠️ @{username} не найден в базе.")
-            return
-        if status == db.STATUS_DELETED:
-            await message.answer(
-                f"⚠️ Пометить @{username} как удалённый?",
-                reply_markup=confirm_kb(f"del:{username}"),
-            )
             return
         await db.set_status(username, status)
         await message.answer(f"Статус @{username} изменён: {status}")

@@ -25,12 +25,11 @@ STATUS_INTEREST = "🔥 Интерес"
 STATUS_CLIENT = "🤝 Клиент"
 STATUS_REJECT = "❌ Отказ"
 STATUS_BAN = "🚫 Бан"
-STATUS_DELETED = "🗑 Удалено"
 STATUS_ARCHIVE = "📦 Архив"
 
 ALL_STATUSES = [
     STATUS_NEW, STATUS_SENT, STATUS_REPLIED, STATUS_INTEREST,
-    STATUS_CLIENT, STATUS_REJECT, STATUS_BAN, STATUS_DELETED, STATUS_ARCHIVE,
+    STATUS_CLIENT, STATUS_REJECT, STATUS_BAN, STATUS_ARCHIVE,
 ]
 
 # короткие коды статусов — используются в callback_data инлайн-кнопок
@@ -41,7 +40,6 @@ STATUS_BY_CODE: dict[str, str] = {
     "client": STATUS_CLIENT,
     "reject": STATUS_REJECT,
     "ban": STATUS_BAN,
-    "deleted": STATUS_DELETED,
     "archive": STATUS_ARCHIVE,
 }
 
@@ -52,7 +50,6 @@ QUICK_STATUS_WORDS: dict[str, str] = {
     "клиент": STATUS_CLIENT,
     "отказ": STATUS_REJECT,
     "бан": STATUS_BAN,
-    "удалено": STATUS_DELETED,
     "архив": STATUS_ARCHIVE,
 }
 
@@ -120,10 +117,28 @@ async def clear_all_leads() -> int:
         return count
 
 
-async def get_all_leads() -> list[Lead]:
+async def count_leads() -> int:
     async with async_session() as session:
-        result = await session.scalars(select(Lead).order_by(Lead.created_at.asc()))
+        return await session.scalar(select(func.count(Lead.id))) or 0
+
+
+async def get_leads_page(offset: int, limit: int) -> list[Lead]:
+    """Один "чанк" лидов по id ASC — без загрузки всей базы в память."""
+    async with async_session() as session:
+        result = await session.scalars(
+            select(Lead).order_by(Lead.id.asc()).offset(offset).limit(limit)
+        )
         return list(result.all())
+
+
+async def get_lead_by_position(position: int) -> Optional[Lead]:
+    """Лид по сквозному номеру (1-based, тот же порядок id ASC, что и в пагинации)."""
+    if position < 1:
+        return None
+    async with async_session() as session:
+        return await session.scalar(
+            select(Lead).order_by(Lead.id.asc()).offset(position - 1).limit(1)
+        )
 
 
 async def get_new_leads(limit: int) -> list[Lead]:
