@@ -204,15 +204,13 @@ def delete_confirm_kb(username: str) -> InlineKeyboardMarkup:
     )
 
 
-def choose_message_kb(recents: list[str]) -> Optional[InlineKeyboardMarkup]:
-    if not recents:
-        return None
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=f"{i + 1}. {m[:30]}", callback_data=f"pickmsg:{i}")]
-            for i, m in enumerate(recents)
-        ]
-    )
+def choose_message_kb(recents: list[str]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=f"{i + 1}. {m[:30]}", callback_data=f"pickmsg:{i}")]
+        for i, m in enumerate(recents)
+    ]
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_choose")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +323,7 @@ def lead_card_text(lead: db.Lead) -> str:
         f"👤 @{lead.username}\n"
         f"Статус: {status_display(lead)}\n"
         f"Сообщение: {lead.message or '—'}\n"
+        f"FU: {lead.fu1_message or '—'} | {lead.fu2_message or '—'}\n"
         f"Отправлен: {fmt_datetime(lead.message_sent_at)}\n"
         f"FU1: {fu_field_text(lead.fu1_due_at, lead.fu1_sent_at)}\n"
         f"FU2: {fu_field_text(lead.fu2_due_at, lead.fu2_sent_at)}\n"
@@ -337,6 +336,7 @@ def lead_list_block(i: int, lead: db.Lead) -> str:
     return (
         f"{i}. @{lead.username} — {status_display(lead)}\n"
         f"  Сообщение: {lead.message or '—'}\n"
+        f"  FU: {lead.fu1_message or '—'} | {lead.fu2_message or '—'}\n"
         f"  Отправлен: {fmt_datetime(lead.message_sent_at)}\n"
         f"  FU1: {fu_field_text(lead.fu1_due_at, lead.fu1_sent_at)} | "
         f"FU2: {fu_field_text(lead.fu2_due_at, lead.fu2_sent_at)}\n"
@@ -366,7 +366,10 @@ async def resolve_leads_selector(message: Message, state: FSMContext, text_value
 # Общий флоу выбора сообщения (используется и в "Новые лиды", и в /msg_leads)
 # ---------------------------------------------------------------------------
 
-async def prompt_choose_message(target: Message, state: FSMContext, purpose: str, fu_stage: Optional[str] = None) -> None:
+async def prompt_choose_message(
+    target: Message, state: FSMContext, purpose: str,
+    fu_stage: Optional[str] = None, title: Optional[str] = None,
+) -> None:
     if fu_stage:
         recents = await db.get_recent_fu_messages(fu_stage, 4)
     else:
@@ -374,7 +377,7 @@ async def prompt_choose_message(target: Message, state: FSMContext, purpose: str
     await state.set_state(Form.choosing_message)
     await state.update_data(purpose=purpose, recent_messages=recents, fu_stage=fu_stage)
 
-    lines = ["Какое сообщение отправлено?", ""]
+    lines = [title or "Какое сообщение отправлено?", ""]
     for i, m in enumerate(recents, start=1):
         lines.append(f"{i}. {m}")
     lines.append("")
@@ -419,6 +422,47 @@ async def apply_chosen_message(target: Message, state: FSMContext, message_label
         await target.answer("\n".join(text_lines), reply_markup=confirm_kb("msg_leads_apply"))
         return
 
+    if purpose == "card_first":
+        username = data.get("username")
+        await state.clear()
+        if not username:
+            await target.answer("Данные устарели, начни заново.", reply_markup=main_menu_kb())
+            return
+        await db.assign_message_and_send([username], message_label)
+        await send_lead_card(target, username)
+        return
+
+    if purpose == "card_fu":
+        username = data.get("username")
+        await state.clear()
+        if not username or fu_stage not in ("fu1", "fu2"):
+            await target.answer("Данные устарели, начни заново.", reply_markup=main_menu_kb())
+            return
+        await db.assign_fu_message([username], fu_stage, message_label)
+        if fu_stage == "fu1":
+            await db.mark_fu1_batch([username])
+        else:
+            await db.mark_fu2_batch([username])
+        await send_lead_card(target, username)
+        return
+
+    if purpose == "followup_fu1":
+        fu2_usernames = data.get("fu2_usernames") or []
+        await state.update_data(fu1_text=message_label)
+        if fu2_usernames:
+            await prompt_choose_message(
+                target, state, purpose="followup_fu2", fu_stage="fu2",
+                title=f"Какой текст FU2 отправлен? (лидов: {len(fu2_usernames)})",
+            )
+            return
+        await finalize_followup(target, state)
+        return
+
+    if purpose == "followup_fu2":
+        await state.update_data(fu2_text=message_label)
+        await finalize_followup(target, state)
+        return
+
     if purpose == "fu_leads":
         usernames = data.get("usernames") or []
         await state.clear()
@@ -434,6 +478,40 @@ async def apply_chosen_message(target: Message, state: FSMContext, message_label
         return
 
     await state.clear()
+
+
+async def send_lead_card(target: Message, username: str) -> None:
+    lead = await db.find_lead(username)
+    if lead:
+        await target.answer(lead_card_text(lead), reply_markup=status_kb(lead))
+
+
+async def finalize_followup(target: Message, state: FSMContext) -> None:
+    """Присваивает выбранные тексты и отмечает сегодняшние FU1/FU2 фактически отправленными."""
+    data = await state.get_data()
+    fu1_usernames = data.get("fu1_usernames") or []
+    fu2_usernames = data.get("fu2_usernames") or []
+    fu1_text = data.get("fu1_text")
+    fu2_text = data.get("fu2_text")
+    await state.clear()
+
+    n1 = n2 = 0
+    if fu1_usernames and fu1_text:
+        await db.assign_fu_message(fu1_usernames, "fu1", fu1_text)
+        n1 = await db.mark_fu1_batch(fu1_usernames)
+    if fu2_usernames and fu2_text:
+        await db.assign_fu_message(fu2_usernames, "fu2", fu2_text)
+        n2 = await db.mark_fu2_batch(fu2_usernames)
+
+    await target.answer(f"✅ Отмечено: FU1 — {n1}, FU2 — {n2}")
+    await followups(target)
+
+
+@router.callback_query(F.data == "cancel_choose")
+async def cb_cancel_choose(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer("Отменено")
 
 
 @router.callback_query(F.data.startswith("pickmsg:"), Form.choosing_message)
@@ -652,11 +730,25 @@ async def search_result(message: Message, state: FSMContext) -> None:
 # ---------------------------------------------------------------------------
 
 @router.callback_query(F.data.startswith("st:"))
-async def cb_set_status(callback: CallbackQuery) -> None:
+async def cb_set_status(callback: CallbackQuery, state: FSMContext) -> None:
     _, username, code = callback.data.split(":", 2)
     status = db.STATUS_BY_CODE.get(code)
     if not status:
         await callback.answer("Неизвестный статус", show_alert=True)
+        return
+
+    # "Отправлено" = первое касание: как в "Новые лиды", спрашиваем, какое сообщение отправлено
+    if code == "sent":
+        if not await db.find_lead(username):
+            await callback.answer("Лид не найден", show_alert=True)
+            return
+        await state.clear()
+        await state.update_data(username=username)
+        await prompt_choose_message(
+            callback.message, state, purpose="card_first",
+            title=f"Какое сообщение отправлено @{username}?",
+        )
+        await callback.answer()
         return
 
     ok = await db.set_status(username, status)
@@ -674,23 +766,27 @@ async def cb_set_status(callback: CallbackQuery) -> None:
 # ---------------------------------------------------------------------------
 
 @router.callback_query(F.data.startswith("markfu1:"))
-async def cb_mark_fu1(callback: CallbackQuery) -> None:
+async def cb_mark_fu1(callback: CallbackQuery, state: FSMContext) -> None:
     username = callback.data.split(":", 1)[1]
-    await db.mark_fu1_batch([username])
-    lead = await db.find_lead(username)
-    if lead:
-        await callback.message.edit_text(lead_card_text(lead), reply_markup=status_kb(lead))
-    await callback.answer("FU1 отмечен отправленным")
+    await state.clear()
+    await state.update_data(username=username)
+    await prompt_choose_message(
+        callback.message, state, purpose="card_fu", fu_stage="fu1",
+        title=f"Какой текст FU1 отправлен @{username}?",
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("markfu2:"))
-async def cb_mark_fu2(callback: CallbackQuery) -> None:
+async def cb_mark_fu2(callback: CallbackQuery, state: FSMContext) -> None:
     username = callback.data.split(":", 1)[1]
-    await db.mark_fu2_batch([username])
-    lead = await db.find_lead(username)
-    if lead:
-        await callback.message.edit_text(lead_card_text(lead), reply_markup=status_kb(lead))
-    await callback.answer("FU2 отмечен отправленным")
+    await state.clear()
+    await state.update_data(username=username)
+    await prompt_choose_message(
+        callback.message, state, purpose="card_fu", fu_stage="fu2",
+        title=f"Какой текст FU2 отправлен @{username}?",
+    )
+    await callback.answer()
 
 
 # ---------------------------------------------------------------------------
@@ -740,13 +836,13 @@ async def followups(message: Message) -> None:
         lines.append("FU1:")
         for l in fu1_leads:
             lines.append(f"@{l.username}")
-            lines.append(l.message or "—")
+            lines.append(l.fu1_message or "—")
             lines.append("FU1: сегодня")
     if fu2_leads:
         lines.append("FU2:")
         for l in fu2_leads:
             lines.append(f"@{l.username}")
-            lines.append(l.message or "—")
+            lines.append(l.fu2_message or "—")
             lines.append("FU2: сегодня")
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[
@@ -769,15 +865,29 @@ async def cb_followup_mark(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data == "confirm:followup_apply")
-async def cb_confirm_followup(callback: CallbackQuery) -> None:
+async def cb_confirm_followup(callback: CallbackQuery, state: FSMContext) -> None:
     global pending_fu1_batch, pending_fu2_batch
-    n1 = await db.mark_fu1_batch(pending_fu1_batch) if pending_fu1_batch else 0
-    n2 = await db.mark_fu2_batch(pending_fu2_batch) if pending_fu2_batch else 0
+    fu1_usernames, fu2_usernames = list(pending_fu1_batch), list(pending_fu2_batch)
     pending_fu1_batch, pending_fu2_batch = [], []
     await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer(f"✅ Отмечено: FU1 — {n1}, FU2 — {n2}")
     await callback.answer()
-    await followups(callback.message)
+
+    if not fu1_usernames and not fu2_usernames:
+        await callback.message.answer("Нечего отмечать.", reply_markup=main_menu_kb())
+        return
+
+    await state.clear()
+    await state.update_data(fu1_usernames=fu1_usernames, fu2_usernames=fu2_usernames)
+    if fu1_usernames:
+        await prompt_choose_message(
+            callback.message, state, purpose="followup_fu1", fu_stage="fu1",
+            title=f"Какой текст FU1 отправлен? (лидов: {len(fu1_usernames)})",
+        )
+    else:
+        await prompt_choose_message(
+            callback.message, state, purpose="followup_fu2", fu_stage="fu2",
+            title=f"Какой текст FU2 отправлен? (лидов: {len(fu2_usernames)})",
+        )
 
 
 # ---------------------------------------------------------------------------
