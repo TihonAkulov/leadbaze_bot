@@ -1,18 +1,23 @@
 """
-bot.py — Telegram-бот для ведения базы лидов (ручные рассылки).
+bot.py — Telegram-бот для ведения базы лидов, V2.
 
-Вся логика бота — здесь. Работа с БД — в database.py.
+Логика поделена по модулям:
+  database.py   — модели и данные (leads, messages, lead_events, notes, backups)
+  migrations.py — перенос со старой схемы (вызывается из database.init_db())
+  messages.py   — рендер раздела «Сообщения»
+  stats.py      — сбор и форматирование статистики
+  backup.py     — резервные копии (.db + .xlsx), восстановление
+  keyboards.py  — все клавиатуры
+  utils.py      — время (МСК), username, парсинг ввода, форматирование
+
 Запуск: python bot.py
 """
 
 from __future__ import annotations
 
 import asyncio
-import datetime as dt
 import logging
 import os
-import re
-from typing import Optional
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -21,18 +26,18 @@ from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    KeyboardButton,
-    Message,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
-)
+from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
 from dotenv import load_dotenv
 
+import backup as backup_mod
 import database as db
+import keyboards as kb
+import stats as stats_mod
+from messages import render_category_list, render_message_card, render_message_full_stats
+from utils import (
+    extract_usernames, fmt_date, fmt_datetime, moscow_now,
+    parse_date_input, parse_position_selector, seconds_until, short,
+)
 
 # ---------------------------------------------------------------------------
 # Настройка
@@ -47,264 +52,32 @@ logger = logging.getLogger("lead_bot")
 
 router = Router()
 
-# один токен: @username / username / t.me/username / telegram.me/username (с http(s):// или без)
-USERNAME_TOKEN_RE = re.compile(
-    r"^(?:https?://)?(?:(?:t\.me|telegram\.me)/)?@?([A-Za-z0-9_]{5,32})/?$",
-    re.IGNORECASE,
-)
-
-RANGE_RE = re.compile(r"^(\d+)\s*-\s*(\d+)$")
-SINGLE_NUM_RE = re.compile(r"^(\d+)$")
-
-# формат даты для /change_date: 28.09 / 28.09.2026 / 28.09 14:00
-DATE_INPUT_RE = re.compile(r"^(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?(?:\s+(\d{1,2}):(\d{2}))?$")
-
-# "последняя выданная пачка" — храним в памяти процесса, как договорились (V1)
 last_batch: list[str] = []
-
-# сегодняшние FU1/FU2 из последнего показа /followup — для общей кнопки "✅ Отправлено"
 pending_fu1_batch: list[str] = []
 pending_fu2_batch: list[str] = []
 
-# размер "страницы" при постраничном просмотре всей базы (пагинация не меняется)
 LEADS_PER_PAGE = 10
 
 
-# ---------------------------------------------------------------------------
-# FSM состояния
-# ---------------------------------------------------------------------------
-
 class Form(StatesGroup):
-    new_leads_count = State()          # ждём число "сколько лидов показать"
-    searching = State()                # ждём username для поиска
-    adding_note = State()              # ждём текст заметки лида
-    choosing_message = State()         # ждём выбор/ввод текста отправленного сообщения
-    msg_leads_range = State()          # /msg_leads: ждём выбор лидов
-    msg_leads_confirm = State()        # /msg_leads: ждём подтверждения
-    stats_message_choice = State()     # /stats: ждём номер сообщения для детальной статистики
-    change_status_selector = State()   # /change_status: ждём выбор лидов
-    change_date_selector = State()     # /change_date: ждём выбор лидов
-    change_date_value = State()        # /change_date: ждём новую дату
-    fu_leads_selector = State()        # /fu_leads: ждём выбор лидов (после выбора FU1/FU2)
-    adding_improvement_note = State()  # ждём текст заметки по улучшению (через кнопку меню)
+    new_leads_count = State()
+    searching = State()
+    adding_note = State()
+    choosing_message = State()
+    msg_leads_range = State()
+    msg_leads_confirm = State()
+    change_status_selector = State()
+    change_date_selector = State()
+    change_date_value = State()
+    fu_leads_selector = State()
+    adding_improvement_note = State()
 
 
 # ---------------------------------------------------------------------------
-# Клавиатуры
+# Общие вспомогательные тексты
 # ---------------------------------------------------------------------------
-
-def main_menu_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📥 Добавить лидов"), KeyboardButton(text="📋 Новые лиды")],
-            [KeyboardButton(text="🔎 Найти лида"), KeyboardButton(text="📊 Статистика")],
-            [KeyboardButton(text="📅 Follow-up"), KeyboardButton(text="📋 Показать всю базу")],
-            [KeyboardButton(text="📝 Заметки")],
-        ],
-        resize_keyboard=True,
-    )
-
-
-def batch_action_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✉️ Отметить отправленными", callback_data="mark_sent"),
-                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_batch"),
-            ]
-        ]
-    )
-
-
-def status_kb(lead: db.Lead) -> InlineKeyboardMarkup:
-    username = lead.username
-    rows = [
-        [InlineKeyboardButton(text="🟡 Отправлено", callback_data=f"st:{username}:sent")],
-        [InlineKeyboardButton(text="💬 Ответил", callback_data=f"st:{username}:replied")],
-        [InlineKeyboardButton(text="🔥 Интерес", callback_data=f"st:{username}:interest")],
-        [InlineKeyboardButton(text="🤝 Клиент", callback_data=f"st:{username}:client")],
-        [InlineKeyboardButton(text="❌ Отказ", callback_data=f"st:{username}:reject")],
-        [InlineKeyboardButton(text="🚫 Бан", callback_data=f"st:{username}:ban")],
-        [InlineKeyboardButton(text="🗑 Удалено", callback_data=f"st:{username}:deleted")],
-        [InlineKeyboardButton(text="📦 Архив", callback_data=f"st:{username}:archive")],
-    ]
-    if lead.status == db.STATUS_SENT:
-        if lead.fu1_sent_at is None:
-            rows.append([InlineKeyboardButton(text="✅ FU1 отправлен", callback_data=f"markfu1:{username}")])
-        elif lead.fu2_sent_at is None:
-            rows.append([InlineKeyboardButton(text="✅ FU2 отправлен", callback_data=f"markfu2:{username}")])
-    rows.append([InlineKeyboardButton(text="📝 Заметка", callback_data=f"note:{username}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def bulk_status_kb() -> InlineKeyboardMarkup:
-    """Клавиатура выбора статуса для массового изменения (/change_status) — не привязана к одному username."""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🟡 Отправлено", callback_data="bulkstatus:sent")],
-        [InlineKeyboardButton(text="💬 Ответил", callback_data="bulkstatus:replied")],
-        [InlineKeyboardButton(text="🔥 Интерес", callback_data="bulkstatus:interest")],
-        [InlineKeyboardButton(text="🤝 Клиент", callback_data="bulkstatus:client")],
-        [InlineKeyboardButton(text="❌ Отказ", callback_data="bulkstatus:reject")],
-        [InlineKeyboardButton(text="🚫 Бан", callback_data="bulkstatus:ban")],
-        [InlineKeyboardButton(text="🗑 Удалено", callback_data="bulkstatus:deleted")],
-        [InlineKeyboardButton(text="📦 Архив", callback_data="bulkstatus:archive")],
-    ])
-
-
-def build_pagination_kb(page: int, total_pages: int, window: int = 1) -> Optional[InlineKeyboardMarkup]:
-    """Компактная пагинация: ⏪ 1 2 … 10 ⏩ (макс. 5 кнопок-цифр). НЕ МЕНЯТЬ — уже согласовано."""
-    if total_pages <= 1:
-        return None
-
-    keep = {1, total_pages}
-    for p in range(page - window, page + window + 1):
-        if 1 <= p <= total_pages:
-            keep.add(p)
-    ordered = sorted(keep)
-
-    buttons: list[InlineKeyboardButton] = []
-    if page > 1:
-        buttons.append(InlineKeyboardButton(text="⏪", callback_data=f"leads_page:{page - 1}"))
-
-    prev_shown: Optional[int] = None
-    for p in ordered:
-        if prev_shown is not None and p - prev_shown > 1:
-            buttons.append(InlineKeyboardButton(text="…", callback_data="noop"))
-        if p == page:
-            buttons.append(InlineKeyboardButton(text=f"·{p}·", callback_data="noop"))
-        else:
-            buttons.append(InlineKeyboardButton(text=str(p), callback_data=f"leads_page:{p}"))
-        prev_shown = p
-
-    if page < total_pages:
-        buttons.append(InlineKeyboardButton(text="⏩", callback_data=f"leads_page:{page + 1}"))
-
-    return InlineKeyboardMarkup(inline_keyboard=[buttons])
-
-
-def confirm_kb(action: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Да", callback_data=f"confirm:{action}"),
-                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_confirm"),
-            ]
-        ]
-    )
-
-
-def delete_confirm_kb(username: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🗑 Удалить", callback_data=f"confirm:delreal:{username}"),
-                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_confirm"),
-            ]
-        ]
-    )
-
-
-def choose_message_kb(recents: list[str]) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text=f"{i + 1}. {m[:30]}", callback_data=f"pickmsg:{i}")]
-        for i, m in enumerate(recents)
-    ]
-    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_choose")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-# ---------------------------------------------------------------------------
-# Вспомогательные функции
-# ---------------------------------------------------------------------------
-
-def normalize_username(token: str) -> Optional[str]:
-    """@username / username / t.me/username / telegram.me/username (с http(s) или без) -> username."""
-    m = USERNAME_TOKEN_RE.match(token.strip())
-    if not m:
-        return None
-    return m.group(1)
-
-
-def extract_usernames(text_value: str) -> list[str]:
-    """Достаёт из текста все username (в т.ч. из ссылок t.me/telegram.me), без дублей, порядок сохранён."""
-    tokens = re.split(r"[\s,]+", text_value.strip())
-    seen: set[str] = set()
-    result: list[str] = []
-    for token in tokens:
-        if not token:
-            continue
-        uname = normalize_username(token)
-        if uname is None:
-            continue
-        low = uname.lower()
-        if low not in seen:
-            seen.add(low)
-            result.append(uname)
-    return result
-
-
-def parse_position_selector(text_value: str) -> Optional[list[int]]:
-    """Разбирает выбор лидов по номерам: "5", "5-20" или "5, 7, 10". Возвращает None при мусоре."""
-    text_value = text_value.strip()
-    if not text_value:
-        return None
-
-    range_match = RANGE_RE.match(text_value)
-    if range_match:
-        start, end = int(range_match.group(1)), int(range_match.group(2))
-        if start > end:
-            start, end = end, start
-        return list(range(start, end + 1))
-
-    single_match = SINGLE_NUM_RE.match(text_value)
-    if single_match:
-        return [int(single_match.group(1))]
-
-    parts = [p.strip() for p in text_value.split(",")]
-    parts = [p for p in parts if p]
-    if parts and all(p.isdigit() for p in parts):
-        return sorted({int(p) for p in parts})
-
-    return None
-
-
-def parse_date_input(text_value: str) -> Optional[dt.datetime]:
-    """Разбирает дату для /change_date: 28.09 / 28.09.2026 / 28.09 14:00."""
-    match = DATE_INPUT_RE.match(text_value.strip())
-    if not match:
-        return None
-    day, month, year, hour, minute = match.groups()
-    try:
-        return dt.datetime(
-            int(year) if year else db.moscow_now().year,
-            int(month),
-            int(day),
-            int(hour) if hour else 9,
-            int(minute) if minute else 0,
-        )
-    except ValueError:
-        return None
-
-
-def fmt_date(value) -> str:
-    return value.strftime("%d.%m.%Y") if value else "—"
-
-
-def fmt_datetime(value) -> str:
-    return value.strftime("%d.%m.%Y %H:%M") if value else "—"
-
-
-def fu_field_text(due_at, sent_at) -> str:
-    """До фактической отправки — только дата плана; после — дата и время факта."""
-    if sent_at:
-        return fmt_datetime(sent_at)
-    if due_at:
-        return fmt_date(due_at)
-    return "—"
-
 
 def status_display(lead: db.Lead) -> str:
-    """Базовый статус + суффикс о последнем фактически отправленном FU / этапе ответа."""
     base = lead.status
     if base == db.STATUS_SENT:
         if lead.fu2_sent_at:
@@ -318,12 +91,30 @@ def status_display(lead: db.Lead) -> str:
     return base
 
 
-def lead_card_text(lead: db.Lead) -> str:
+def fu_field_text(due_at, sent_at) -> str:
+    if sent_at:
+        return fmt_datetime(sent_at)
+    if due_at:
+        return fmt_date(due_at)
+    return "—"
+
+
+async def _msg_title(message_id) -> str:
+    if not message_id:
+        return "—"
+    msg = await db.get_message(message_id)
+    return msg.title if msg else "—"
+
+
+async def lead_card_text(lead: db.Lead) -> str:
+    first_title = await _msg_title(lead.message_id)
+    fu1_title = await _msg_title(lead.fu1_message_id)
+    fu2_title = await _msg_title(lead.fu2_message_id)
     return (
         f"👤 @{lead.username}\n"
         f"Статус: {status_display(lead)}\n"
-        f"Сообщение: {lead.message or '—'}\n"
-        f"FU: {lead.fu1_message or '—'} | {lead.fu2_message or '—'}\n"
+        f"Сообщение: {first_title}\n"
+        f"FU: {fu1_title} | {fu2_title}\n"
         f"Отправлен: {fmt_datetime(lead.message_sent_at)}\n"
         f"FU1: {fu_field_text(lead.fu1_due_at, lead.fu1_sent_at)}\n"
         f"FU2: {fu_field_text(lead.fu2_due_at, lead.fu2_sent_at)}\n"
@@ -331,12 +122,14 @@ def lead_card_text(lead: db.Lead) -> str:
     )
 
 
-def lead_list_block(i: int, lead: db.Lead) -> str:
-    """Компактный блок одного лида в постраничном списке (пагинация не меняется, только поля)."""
+async def lead_list_block(i: int, lead: db.Lead) -> str:
+    first_title = await _msg_title(lead.message_id)
+    fu1_title = await _msg_title(lead.fu1_message_id)
+    fu2_title = await _msg_title(lead.fu2_message_id)
     return (
         f"{i}. @{lead.username} — {status_display(lead)}\n"
-        f"  Сообщение: {lead.message or '—'}\n"
-        f"  FU: {lead.fu1_message or '—'} | {lead.fu2_message or '—'}\n"
+        f"  Сообщение: {first_title}\n"
+        f"  FU: {fu1_title} | {fu2_title}\n"
         f"  Отправлен: {fmt_datetime(lead.message_sent_at)}\n"
         f"  FU1: {fu_field_text(lead.fu1_due_at, lead.fu1_sent_at)} | "
         f"FU2: {fu_field_text(lead.fu2_due_at, lead.fu2_sent_at)}\n"
@@ -344,101 +137,94 @@ def lead_list_block(i: int, lead: db.Lead) -> str:
     )
 
 
-# ---------------------------------------------------------------------------
-# Общий флоу выбора лидов по номерам (используется /msg_leads, /change_status, /change_date)
-# ---------------------------------------------------------------------------
+async def send_lead_card(target: Message, username: str) -> None:
+    lead = await db.find_lead(username)
+    if lead:
+        await target.answer(await lead_card_text(lead), reply_markup=kb.status_kb(lead))
 
-async def resolve_leads_selector(message: Message, state: FSMContext, text_value: str) -> Optional[list[db.Lead]]:
-    """Разбирает ввод, находит лидов. При ошибке/пустом результате сама отвечает и чистит state. None — если дальше двигаться нельзя."""
+
+async def resolve_leads_selector(message: Message, state: FSMContext, text_value: str) -> list[db.Lead] | None:
     positions = parse_position_selector(text_value)
     if positions is None:
         await message.answer("Не понял формат. Примеры: 5   5-20   5, 7, 10")
         return None
     leads = await db.get_leads_by_positions(positions)
     if not leads:
-        await message.answer("Лидов с такими номерами не нашлось.", reply_markup=main_menu_kb())
+        await message.answer("Лидов с такими номерами не нашлось.", reply_markup=kb.main_menu_kb())
         await state.clear()
         return None
     return leads
 
 
 # ---------------------------------------------------------------------------
-# Общий флоу выбора сообщения (используется и в "Новые лиды", и в /msg_leads)
+# Общий флоу выбора сообщения
 # ---------------------------------------------------------------------------
 
-async def prompt_choose_message(
-    target: Message, state: FSMContext, purpose: str,
-    fu_stage: Optional[str] = None, title: Optional[str] = None,
-) -> None:
-    if fu_stage:
-        recents = await db.get_recent_fu_messages(fu_stage, 4)
-    else:
-        recents = await db.get_recent_messages(4)
+async def prompt_choose_message(target: Message, state: FSMContext, purpose: str, category: str, title: str | None = None) -> None:
+    recents = await db.get_recent_messages(category, 4)
     await state.set_state(Form.choosing_message)
-    await state.update_data(purpose=purpose, recent_messages=recents, fu_stage=fu_stage)
-
+    await state.update_data(purpose=purpose, category=category, recent_ids=[m.id for m in recents], recent_texts=[m.content for m in recents])
     lines = [title or "Какое сообщение отправлено?", ""]
     for i, m in enumerate(recents, start=1):
-        lines.append(f"{i}. {m}")
+        lines.append(f"{i}. {short(m.content, 60)}")
     lines.append("")
-    lines.append("Или напишите сообщение вручную.")
-    await target.answer("\n".join(lines), reply_markup=choose_message_kb(recents))
+    lines.append("Или напишите текст сообщения вручную.")
+    await target.answer("\n".join(lines), reply_markup=kb.choose_message_kb(recents))
 
 
-async def apply_chosen_message(target: Message, state: FSMContext, message_label: str) -> None:
+async def apply_chosen_message(target: Message, state: FSMContext, content: str) -> None:
     data = await state.get_data()
     purpose = data.get("purpose")
-    fu_stage = data.get("fu_stage")
+    category = data.get("category")
+    message_obj = await db.get_or_create_message(category, content)
 
     if purpose == "batch_mark_sent":
         await state.clear()
         global last_batch
         if not last_batch:
-            await target.answer("Пачка уже пуста.", reply_markup=main_menu_kb())
+            await target.answer("Пачка уже пуста.", reply_markup=kb.main_menu_kb())
             return
-        count = await db.assign_message_and_send(last_batch, message_label)
+        count = await db.assign_message_and_send(last_batch, message_obj.id)
         last_batch = []
-        await target.answer(
-            f"✅ Отмечено отправленными: {count}\nСообщение: «{message_label}»",
-            reply_markup=main_menu_kb(),
-        )
+        await target.answer(f"✅ Отмечено отправленными: {count}\nСообщение: {message_obj.title}", reply_markup=kb.main_menu_kb())
         return
 
     if purpose == "msg_leads":
         usernames = data.get("usernames") or []
         selector_text = data.get("selector_text", "")
-        await state.update_data(usernames=usernames, message_label=message_label)
+        await state.update_data(usernames=usernames, message_id=message_obj.id, message_title=message_obj.title)
         await state.set_state(Form.msg_leads_confirm)
         text_lines = [
             "⚠️ Проверьте данные",
             f"Лиды: {selector_text}",
             f"Количество: {len(usernames)}",
             "Сообщение:",
-            f"«{message_label}»",
+            message_obj.title,
             "",
-            "Статус и дата отправки НЕ меняются — только текст сообщения.",
+            "Статус и дата отправки НЕ меняются — только сообщение.",
             "Продолжить?",
         ]
-        await target.answer("\n".join(text_lines), reply_markup=confirm_kb("msg_leads_apply"))
+        await target.answer("\n".join(text_lines), reply_markup=kb.confirm_kb("msg_leads_apply"))
         return
 
     if purpose == "card_first":
         username = data.get("username")
         await state.clear()
         if not username:
-            await target.answer("Данные устарели, начни заново.", reply_markup=main_menu_kb())
+            await target.answer("Данные устарели, начни заново.", reply_markup=kb.main_menu_kb())
             return
-        await db.assign_message_and_send([username], message_label)
+        await db.assign_message_and_send([username], message_obj.id)
         await send_lead_card(target, username)
         return
 
     if purpose == "card_fu":
         username = data.get("username")
+        fu_stage = "fu1" if category == "fu1" else "fu2"
         await state.clear()
-        if not username or fu_stage not in ("fu1", "fu2"):
-            await target.answer("Данные устарели, начни заново.", reply_markup=main_menu_kb())
+        if not username:
+            await target.answer("Данные устарели, начни заново.", reply_markup=kb.main_menu_kb())
             return
-        await db.assign_fu_message([username], fu_stage, message_label)
+        await db.assign_fu_message([username], fu_stage, message_obj.id)
         if fu_stage == "fu1":
             await db.mark_fu1_batch([username])
         else:
@@ -448,63 +234,61 @@ async def apply_chosen_message(target: Message, state: FSMContext, message_label
 
     if purpose == "followup_fu1":
         fu2_usernames = data.get("fu2_usernames") or []
-        await state.update_data(fu1_text=message_label)
+        await state.update_data(fu1_message_id=message_obj.id)
         if fu2_usernames:
-            await prompt_choose_message(
-                target, state, purpose="followup_fu2", fu_stage="fu2",
-                title=f"Какой текст FU2 отправлен? (лидов: {len(fu2_usernames)})",
-            )
+            await prompt_choose_message(target, state, purpose="followup_fu2", category="fu2",
+                                         title=f"Какой текст FU2 отправлен? (лидов: {len(fu2_usernames)})")
             return
         await finalize_followup(target, state)
         return
 
     if purpose == "followup_fu2":
-        await state.update_data(fu2_text=message_label)
+        await state.update_data(fu2_message_id=message_obj.id)
         await finalize_followup(target, state)
         return
 
     if purpose == "fu_leads":
         usernames = data.get("usernames") or []
+        fu_stage = data.get("fu_stage")
         await state.clear()
         if not usernames or fu_stage not in ("fu1", "fu2"):
-            await target.answer("Данные устарели, начни заново.", reply_markup=main_menu_kb())
+            await target.answer("Данные устарели, начни заново.", reply_markup=kb.main_menu_kb())
             return
-        count = await db.assign_fu_message(usernames, fu_stage, message_label)
+        count = await db.assign_fu_message(usernames, fu_stage, message_obj.id)
         label = "FU1" if fu_stage == "fu1" else "FU2"
-        await target.answer(
-            f"✅ Сообщение {label} присвоено {count} лидам: «{message_label}»",
-            reply_markup=main_menu_kb(),
-        )
+        await target.answer(f"✅ Сообщение {label} присвоено {count} лидам: {message_obj.title}", reply_markup=kb.main_menu_kb())
+        return
+
+    if purpose == "msguse":
+        usernames = data.get("usernames") or []
+        await state.clear()
+        if not usernames:
+            await target.answer("Данные устарели, начни заново.", reply_markup=kb.main_menu_kb())
+            return
+        count = await db.assign_message_only(usernames, message_obj.id)
+        await target.answer(f"✅ Сообщение присвоено {count} лидам: {message_obj.title}", reply_markup=kb.main_menu_kb())
         return
 
     await state.clear()
 
 
-async def send_lead_card(target: Message, username: str) -> None:
-    lead = await db.find_lead(username)
-    if lead:
-        await target.answer(lead_card_text(lead), reply_markup=status_kb(lead))
-
-
 async def finalize_followup(target: Message, state: FSMContext) -> None:
-    """Присваивает выбранные тексты и отмечает сегодняшние FU1/FU2 фактически отправленными."""
     data = await state.get_data()
     fu1_usernames = data.get("fu1_usernames") or []
     fu2_usernames = data.get("fu2_usernames") or []
-    fu1_text = data.get("fu1_text")
-    fu2_text = data.get("fu2_text")
+    fu1_message_id = data.get("fu1_message_id")
+    fu2_message_id = data.get("fu2_message_id")
     await state.clear()
 
     n1 = n2 = 0
-    if fu1_usernames and fu1_text:
-        await db.assign_fu_message(fu1_usernames, "fu1", fu1_text)
+    if fu1_usernames and fu1_message_id:
+        await db.assign_fu_message(fu1_usernames, "fu1", fu1_message_id)
         n1 = await db.mark_fu1_batch(fu1_usernames)
-    if fu2_usernames and fu2_text:
-        await db.assign_fu_message(fu2_usernames, "fu2", fu2_text)
+    if fu2_usernames and fu2_message_id:
+        await db.assign_fu_message(fu2_usernames, "fu2", fu2_message_id)
         n2 = await db.mark_fu2_batch(fu2_usernames)
 
-    await target.answer(f"✅ Отмечено: FU1 — {n1}, FU2 — {n2}")
-    await followups(target)
+    await target.answer(f"✅ Отмечено: FU1 — {n1}, FU2 — {n2}", reply_markup=kb.main_menu_kb())
 
 
 @router.callback_query(F.data == "cancel_choose")
@@ -518,13 +302,12 @@ async def cb_cancel_choose(callback: CallbackQuery, state: FSMContext) -> None:
 async def cb_pick_message(callback: CallbackQuery, state: FSMContext) -> None:
     idx = int(callback.data.split(":", 1)[1])
     data = await state.get_data()
-    recents = data.get("recent_messages") or []
-    if idx < 0 or idx >= len(recents):
+    texts = data.get("recent_texts") or []
+    if idx < 0 or idx >= len(texts):
         await callback.answer("Такого варианта уже нет.", show_alert=True)
         return
-    message_label = recents[idx]
     await callback.message.edit_reply_markup(reply_markup=None)
-    await apply_chosen_message(callback.message, state, message_label)
+    await apply_chosen_message(callback.message, state, texts[idx])
     await callback.answer()
 
 
@@ -538,49 +321,262 @@ async def msg_choose_manual(message: Message, state: FSMContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# /start, /help
+# Навигация: /start, /help, главное меню
 # ---------------------------------------------------------------------------
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
-        "Привет! Я бот для ведения базы лидов.\n\n"
-        "Пришли список username (можно @user1 @user2, ссылками t.me/username, "
-        "или каждый с новой строки) — я добавлю новых в базу.\n\n"
-        "Или используй меню ниже.",
-        reply_markup=main_menu_kb(),
+        "Привет! Бот для ведения базы лидов.\n\nВыбери раздел в меню ниже.",
+        reply_markup=kb.main_menu_kb(),
     )
 
 
 @router.message(Command("help"))
-async def cmd_help(message: Message) -> None:
-    await message.answer(
-        "📥 Добавить лидов — пришли список @username / ссылок t.me/username\n"
-        "📋 Новые лиды — выдать пачку ещё не отправленных\n"
-        "🔎 Найти лида — карточка, смена статуса, отметка FU, заметка\n"
-        "📊 Статистика (/stats) — общая сводка + по конкретному сообщению\n"
-        "📅 Follow-up (/followup) — кому сегодня FU1/FU2\n"
-        "📋 Показать всю базу — постранично; /5 откроет лида №5\n"
-        "📝 Заметки — добавить / посмотреть / удалить все заметки по улучшению\n\n"
-        "/msg_leads — присвоить лидам текст сообщения (статус и дата НЕ меняются)\n"
-        "/fu_leads — присвоить лидам текст FU1- или FU2-сообщения\n"
-        "/change_status — массово сменить статус (5 / 5-20 / 5, 7, 10)\n"
-        "/change_date — массово поменять дату первой отправки (пересчитает FU1/FU2, статус не тронет)\n"
-        "/note текст, /get_notes, /del_notes — то же самое, что кнопка «📝 Заметки», текстом\n"
-        "/del@username — удалить лида навсегда (с подтверждением)\n"
-        "/clear_db — полностью очистить базу (с подтверждением)\n\n"
-        "Быстрая смена статуса: @username интерес / ответил / клиент / отказ / бан / удалено / архив",
-        reply_markup=main_menu_kb(),
+@router.callback_query(F.data == "other:help")
+async def cmd_help(event) -> None:
+    text = (
+        "👤 <b>Лиды</b> — добавить, новые, поиск, вся база\n"
+        "💬 <b>Сообщения</b> — библиотека текстов (первое/FU1/FU2), статистика по каждому\n"
+        "📅 <b>Follow-up</b> — кому сегодня писать\n"
+        "📊 <b>Статистика</b> — по периодам и по сообщениям\n"
+        "💾 <b>Бэкап</b> — .db + .xlsx, история, восстановление\n"
+        "⚙️ <b>Другое</b> — заметки, помощь, очистка базы\n\n"
+        "Быстрая смена статуса текстом: @username интерес / ответил / клиент / отказ / бан / удалено / архив\n"
+        "/msg_leads, /fu_leads, /change_status, /change_date, /del@username — как раньше, текстовыми командами"
     )
+    if isinstance(event, Message):
+        await event.answer(text, reply_markup=kb.main_menu_kb())
+    else:
+        await event.message.answer(text, reply_markup=kb.main_menu_kb())
+        await event.answer()
+
+
+@router.callback_query(F.data == "nav:main")
+async def cb_nav_main(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# Раздел «Лиды»
+# ---------------------------------------------------------------------------
+
+@router.message(F.text == "👤 Лиды")
+@router.callback_query(F.data == "leads:menu")
+async def leads_menu(event) -> None:
+    summary = await stats_mod.render_leads_summary()
+    text = f"👤 <b>ЛИДЫ</b>\n{summary}"
+    if isinstance(event, Message):
+        await event.answer(text, reply_markup=kb.leads_menu_kb())
+    else:
+        await event.message.edit_text(text, reply_markup=kb.leads_menu_kb())
+        await event.answer()
+
+
+@router.callback_query(F.data == "leads:add")
+async def cb_leads_add(callback: CallbackQuery) -> None:
+    await callback.message.answer("Пришли список username, например:\n@user1\nhttps://t.me/user2\nuser3")
+    await callback.answer()
+
+
+async def process_add_leads(message: Message, usernames: list[str]) -> None:
+    added, duplicates = await db.add_leads(usernames)
+    lines = ["✅ <b>Лиды добавлены</b>", "", f"Добавлено: {len(added)}", f"Уже были: {len(duplicates)}"]
+    await message.answer("\n".join(lines), reply_markup=kb.after_add_leads_kb())
+
+
+@router.callback_query(F.data == "leads:new")
+async def cb_leads_new(callback: CallbackQuery) -> None:
+    total_new = len(await db.get_new_leads(10**9))
+    await callback.message.answer(f"Доступно новых (⚪): {total_new}\nСколько показать?", reply_markup=kb.new_leads_count_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("newcount:"))
+async def cb_new_count(callback: CallbackQuery, state: FSMContext) -> None:
+    value = callback.data.split(":", 1)[1]
+    await callback.message.edit_reply_markup(reply_markup=None)
+    if value == "custom":
+        await state.set_state(Form.new_leads_count)
+        await callback.message.answer("Сколько лидов показать? Пришли число.")
+        await callback.answer()
+        return
+    await callback.answer()
+    await _show_new_leads(callback.message, int(value))
+
+
+@router.message(Form.new_leads_count)
+async def new_leads_count_input(message: Message, state: FSMContext) -> None:
+    text_value = (message.text or "").strip()
+    if not text_value.isdigit():
+        await message.answer("Пришли число, например: 20")
+        return
+    await state.clear()
+    await _show_new_leads(message, int(text_value))
+
+
+async def _show_new_leads(message: Message, limit: int) -> None:
+    leads = await db.get_new_leads(limit)
+    if not leads:
+        await message.answer("Новых лидов со статусом ⚪ нет.", reply_markup=kb.main_menu_kb())
+        return
+    global last_batch
+    last_batch = [l.username for l in leads]
+    lines = "\n".join(f"{i}. @{u}" for i, u in enumerate(last_batch, start=1))
+    await message.answer(f"📋 Новые лиды — {len(last_batch)}\n{lines}", reply_markup=kb.batch_action_kb())
+
+
+@router.callback_query(F.data == "mark_sent")
+async def cb_mark_sent(callback: CallbackQuery, state: FSMContext) -> None:
+    if not last_batch:
+        await callback.answer("Пачка уже пуста.", show_alert=True)
+        return
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await prompt_choose_message(callback.message, state, purpose="batch_mark_sent", category="initial",
+                                 title="Какое сообщение отправлено?")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "cancel_batch")
+async def cb_cancel_batch(callback: CallbackQuery) -> None:
+    global last_batch
+    last_batch = []
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer("Отменено")
+
+
+@router.callback_query(F.data == "leads:find")
+async def cb_leads_find(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(Form.searching)
+    await callback.message.answer("Пришли username лида (можно с @, без, или ссылку t.me/...).")
+    await callback.answer()
+
+
+@router.message(Form.searching)
+async def search_result(message: Message, state: FSMContext) -> None:
+    usernames = extract_usernames(message.text or "")
+    await state.clear()
+    if not usernames:
+        await message.answer("Не нашёл username в сообщении.", reply_markup=kb.main_menu_kb())
+        return
+    lead = await db.find_lead(usernames[0])
+    if not lead:
+        await message.answer(f"⚠️ @{usernames[0]} не найден в базе.", reply_markup=kb.main_menu_kb())
+        return
+    await message.answer(await lead_card_text(lead), reply_markup=kb.status_kb(lead))
+
+
+# ---------------------------------------------------------------------------
+# Статус / FU с карточки лида
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data.startswith("st:"))
+async def cb_set_status(callback: CallbackQuery, state: FSMContext) -> None:
+    _, username, code = callback.data.split(":", 2)
+    status = db.STATUS_BY_CODE.get(code)
+    if not status:
+        await callback.answer("Неизвестный статус", show_alert=True)
+        return
+
+    if code == "sent":
+        if not await db.find_lead(username):
+            await callback.answer("Лид не найден", show_alert=True)
+            return
+        await state.clear()
+        await state.update_data(username=username)
+        await prompt_choose_message(callback.message, state, purpose="card_first", category="initial",
+                                     title=f"Какое сообщение отправлено @{username}?")
+        await callback.answer()
+        return
+
+    ok = await db.set_status(username, status)
+    if ok:
+        await callback.answer(f"Статус изменён: {status}")
+        lead = await db.find_lead(username)
+        if lead:
+            await callback.message.edit_text(await lead_card_text(lead), reply_markup=kb.status_kb(lead))
+    else:
+        await callback.answer("Лид не найден", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("markfu1:"))
+async def cb_mark_fu1(callback: CallbackQuery, state: FSMContext) -> None:
+    username = callback.data.split(":", 1)[1]
+    await state.clear()
+    await state.update_data(username=username)
+    await prompt_choose_message(callback.message, state, purpose="card_fu", category="fu1",
+                                 title=f"Какой текст FU1 отправлен @{username}?")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("markfu2:"))
+async def cb_mark_fu2(callback: CallbackQuery, state: FSMContext) -> None:
+    username = callback.data.split(":", 1)[1]
+    await state.clear()
+    await state.update_data(username=username)
+    await prompt_choose_message(callback.message, state, purpose="card_fu", category="fu2",
+                                 title=f"Какой текст FU2 отправлен @{username}?")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("note:"))
+async def cb_note_start(callback: CallbackQuery, state: FSMContext) -> None:
+    username = callback.data.split(":", 1)[1]
+    await state.set_state(Form.adding_note)
+    await state.update_data(username=username)
+    await callback.message.answer(f"Пришли текст заметки для @{username}:")
+    await callback.answer()
+
+
+@router.message(Form.adding_note)
+async def note_save(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    username = data.get("username")
+    await state.clear()
+    if not username:
+        await message.answer("Что-то пошло не так, попробуй заново.", reply_markup=kb.main_menu_kb())
+        return
+    await db.set_note(username, message.text or "")
+    await message.answer(f"📝 Заметка для @{username} сохранена.", reply_markup=kb.main_menu_kb())
+
+
+# ---------------------------------------------------------------------------
+# /del@username, /clear_db
+# ---------------------------------------------------------------------------
+
+@router.message(F.text.regexp(r"^/del@([A-Za-z0-9_]{5,32})$"))
+async def cmd_del_lead(message: Message) -> None:
+    username = message.text[len("/del@"):]
+    if not await db.find_lead(username):
+        await message.answer(f"⚠️ @{username} не найден в базе.")
+        return
+    await message.answer(
+        f"⚠️ Удалить лида @{username}?\nЛид будет удалён НАВСЕГДА из базы.",
+        reply_markup=kb.delete_confirm_kb(username),
+    )
+
+
+@router.callback_query(F.data.startswith("confirm:delreal:"))
+async def cb_confirm_delete_real(callback: CallbackQuery) -> None:
+    username = callback.data.split(":", 2)[2]
+    ok = await db.delete_lead(username)
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(f"🗑 @{username} удалён навсегда." if ok else f"⚠️ @{username} не найден в базе.")
+    await callback.answer()
 
 
 @router.message(Command("clear_db"))
-async def cmd_clear_db(message: Message) -> None:
-    await message.answer(
-        "⚠️ Это удалит ВСЮ базу лидов без возможности восстановления. Продолжить?",
-        reply_markup=confirm_kb("clear_db"),
-    )
+@router.callback_query(F.data == "other:clear_db")
+async def cmd_clear_db(event) -> None:
+    text = "⚠️ Это удалит ВСЮ базу лидов без возможности восстановления (кроме бэкапов). Продолжить?"
+    if isinstance(event, Message):
+        await event.answer(text, reply_markup=kb.confirm_kb("clear_db"))
+    else:
+        await event.message.answer(text, reply_markup=kb.confirm_kb("clear_db"))
+        await event.answer()
 
 
 @router.callback_query(F.data == "confirm:clear_db")
@@ -600,298 +596,7 @@ async def cb_cancel_confirm(callback: CallbackQuery) -> None:
 
 
 # ---------------------------------------------------------------------------
-# /del@username — удаление навсегда
-# ---------------------------------------------------------------------------
-
-@router.message(F.text.regexp(r"^/del@([A-Za-z0-9_]{5,32})$"))
-async def cmd_del_lead(message: Message) -> None:
-    username = message.text[len("/del@"):]
-    lead = await db.find_lead(username)
-    if not lead:
-        await message.answer(f"⚠️ @{username} не найден в базе.")
-        return
-    await message.answer(
-        f"⚠️ Удалить лида @{username}?\nЛид будет удалён НАВСЕГДА из базы.",
-        reply_markup=delete_confirm_kb(username),
-    )
-
-
-@router.callback_query(F.data.startswith("confirm:delreal:"))
-async def cb_confirm_delete_real(callback: CallbackQuery) -> None:
-    username = callback.data.split(":", 2)[2]
-    ok = await db.delete_lead(username)
-    await callback.message.edit_reply_markup(reply_markup=None)
-    if ok:
-        await callback.message.answer(f"🗑 @{username} удалён навсегда.")
-    else:
-        await callback.message.answer(f"⚠️ @{username} не найден в базе.")
-    await callback.answer()
-
-
-# ---------------------------------------------------------------------------
-# 📋 Новые лиды
-# ---------------------------------------------------------------------------
-
-@router.message(F.text == "📋 Новые лиды")
-async def new_leads_start(message: Message, state: FSMContext) -> None:
-    await state.set_state(Form.new_leads_count)
-    await message.answer("Сколько лидов показать?", reply_markup=ReplyKeyboardRemove())
-
-
-@router.message(Form.new_leads_count)
-async def new_leads_count(message: Message, state: FSMContext) -> None:
-    text_value = (message.text or "").strip()
-    if not text_value.isdigit():
-        await message.answer("Пришли число, например: 20")
-        return
-    limit = int(text_value)
-    await state.clear()
-
-    leads = await db.get_new_leads(limit)
-    if not leads:
-        await message.answer("Новых лидов со статусом ⚪ Не отправлено нет.", reply_markup=main_menu_kb())
-        return
-
-    global last_batch
-    last_batch = [l.username for l in leads]
-
-    lines = "\n".join(f"@{u}" for u in last_batch)
-    await message.answer(
-        f"📋 Новые лиды — {len(last_batch)}\n{lines}",
-        reply_markup=batch_action_kb(),
-    )
-    await message.answer("Меню:", reply_markup=main_menu_kb())
-
-
-@router.callback_query(F.data == "mark_sent")
-async def cb_mark_sent(callback: CallbackQuery, state: FSMContext) -> None:
-    if not last_batch:
-        await callback.answer("Пачка уже пуста.", show_alert=True)
-        return
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await prompt_choose_message(callback.message, state, purpose="batch_mark_sent")
-    await callback.answer()
-
-
-@router.callback_query(F.data == "cancel_batch")
-async def cb_cancel_batch(callback: CallbackQuery) -> None:
-    global last_batch
-    last_batch = []
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.answer("Отменено")
-
-
-# ---------------------------------------------------------------------------
-# 📥 Добавить лидов (кнопка) + свободная отправка списка username
-# ---------------------------------------------------------------------------
-
-@router.message(F.text == "📥 Добавить лидов")
-async def add_leads_prompt(message: Message) -> None:
-    await message.answer("Пришли список username, например:\n@user1\nhttps://t.me/user2\nuser3")
-
-
-async def process_add_leads(message: Message, usernames: list[str]) -> None:
-    added, duplicates = await db.add_leads(usernames)
-    lines = ["📥 Результат", f"✅ Добавлено: {len(added)}", f"⚠️ Уже были в базе: {len(duplicates)}"]
-    if added:
-        lines.append("Новые:")
-        lines.extend(f"@{u}" for u in added)
-    await message.answer("\n".join(lines), reply_markup=main_menu_kb())
-
-
-# ---------------------------------------------------------------------------
-# 🔎 Найти лида
-# ---------------------------------------------------------------------------
-
-@router.message(F.text == "🔎 Найти лида")
-async def search_start(message: Message, state: FSMContext) -> None:
-    await state.set_state(Form.searching)
-    await message.answer("Пришли username лида (можно с @ или без, или ссылку t.me/...).", reply_markup=ReplyKeyboardRemove())
-
-
-@router.message(Form.searching)
-async def search_result(message: Message, state: FSMContext) -> None:
-    usernames = extract_usernames(message.text or "")
-    await state.clear()
-    if not usernames:
-        await message.answer("Не нашёл username в сообщении.", reply_markup=main_menu_kb())
-        return
-    username = usernames[0]
-    lead = await db.find_lead(username)
-    if not lead:
-        await message.answer(f"⚠️ @{username} не найден в базе.", reply_markup=main_menu_kb())
-        return
-    await message.answer(lead_card_text(lead), reply_markup=status_kb(lead))
-    await message.answer("Меню:", reply_markup=main_menu_kb())
-
-
-# ---------------------------------------------------------------------------
-# Изменение статуса из карточки (инлайн-кнопки)
-# ---------------------------------------------------------------------------
-
-@router.callback_query(F.data.startswith("st:"))
-async def cb_set_status(callback: CallbackQuery, state: FSMContext) -> None:
-    _, username, code = callback.data.split(":", 2)
-    status = db.STATUS_BY_CODE.get(code)
-    if not status:
-        await callback.answer("Неизвестный статус", show_alert=True)
-        return
-
-    # "Отправлено" = первое касание: как в "Новые лиды", спрашиваем, какое сообщение отправлено
-    if code == "sent":
-        if not await db.find_lead(username):
-            await callback.answer("Лид не найден", show_alert=True)
-            return
-        await state.clear()
-        await state.update_data(username=username)
-        await prompt_choose_message(
-            callback.message, state, purpose="card_first",
-            title=f"Какое сообщение отправлено @{username}?",
-        )
-        await callback.answer()
-        return
-
-    ok = await db.set_status(username, status)
-    if ok:
-        await callback.answer(f"Статус изменён: {status}")
-        lead = await db.find_lead(username)
-        if lead:
-            await callback.message.edit_text(lead_card_text(lead), reply_markup=status_kb(lead))
-    else:
-        await callback.answer("Лид не найден", show_alert=True)
-
-
-# ---------------------------------------------------------------------------
-# Фактическая отправка FU1 / FU2 с карточки лида
-# ---------------------------------------------------------------------------
-
-@router.callback_query(F.data.startswith("markfu1:"))
-async def cb_mark_fu1(callback: CallbackQuery, state: FSMContext) -> None:
-    username = callback.data.split(":", 1)[1]
-    await state.clear()
-    await state.update_data(username=username)
-    await prompt_choose_message(
-        callback.message, state, purpose="card_fu", fu_stage="fu1",
-        title=f"Какой текст FU1 отправлен @{username}?",
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("markfu2:"))
-async def cb_mark_fu2(callback: CallbackQuery, state: FSMContext) -> None:
-    username = callback.data.split(":", 1)[1]
-    await state.clear()
-    await state.update_data(username=username)
-    await prompt_choose_message(
-        callback.message, state, purpose="card_fu", fu_stage="fu2",
-        title=f"Какой текст FU2 отправлен @{username}?",
-    )
-    await callback.answer()
-
-
-# ---------------------------------------------------------------------------
-# Заметка лида
-# ---------------------------------------------------------------------------
-
-@router.callback_query(F.data.startswith("note:"))
-async def cb_note_start(callback: CallbackQuery, state: FSMContext) -> None:
-    username = callback.data.split(":", 1)[1]
-    await state.set_state(Form.adding_note)
-    await state.update_data(username=username)
-    await callback.message.answer(f"Пришли текст заметки для @{username}:")
-    await callback.answer()
-
-
-@router.message(Form.adding_note)
-async def note_save(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    username = data.get("username")
-    await state.clear()
-    if not username:
-        await message.answer("Что-то пошло не так, попробуй заново.", reply_markup=main_menu_kb())
-        return
-    await db.set_note(username, message.text or "")
-    await message.answer(f"📝 Заметка для @{username} сохранена.", reply_markup=main_menu_kb())
-
-
-# ---------------------------------------------------------------------------
-# 📅 Follow-up
-# ---------------------------------------------------------------------------
-
-@router.message(F.text == "📅 Follow-up")
-@router.message(Command("followup"))
-async def followups(message: Message) -> None:
-    fu1_leads, fu2_leads = await db.get_followups_due()
-
-    global pending_fu1_batch, pending_fu2_batch
-    pending_fu1_batch = [l.username for l in fu1_leads]
-    pending_fu2_batch = [l.username for l in fu2_leads]
-
-    if not fu1_leads and not fu2_leads:
-        await message.answer("🔔 На сегодня follow-up нет.", reply_markup=main_menu_kb())
-        return
-
-    lines = ["🔔 FOLLOW-UP НА СЕГОДНЯ"]
-    if fu1_leads:
-        lines.append("FU1:")
-        for l in fu1_leads:
-            lines.append(f"@{l.username}")
-            lines.append(l.fu1_message or "—")
-            lines.append("FU1: сегодня")
-    if fu2_leads:
-        lines.append("FU2:")
-        for l in fu2_leads:
-            lines.append(f"@{l.username}")
-            lines.append(l.fu2_message or "—")
-            lines.append("FU2: сегодня")
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Отправлено", callback_data="followup_mark"),
-    ]])
-    await message.answer("\n".join(lines), reply_markup=kb)
-
-
-@router.callback_query(F.data == "followup_mark")
-async def cb_followup_mark(callback: CallbackQuery) -> None:
-    if not pending_fu1_batch and not pending_fu2_batch:
-        await callback.answer("Нечего отмечать.", show_alert=True)
-        return
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer(
-        "Будут отмечены отправленными все сегодняшние FU.\nПродолжить?",
-        reply_markup=confirm_kb("followup_apply"),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "confirm:followup_apply")
-async def cb_confirm_followup(callback: CallbackQuery, state: FSMContext) -> None:
-    global pending_fu1_batch, pending_fu2_batch
-    fu1_usernames, fu2_usernames = list(pending_fu1_batch), list(pending_fu2_batch)
-    pending_fu1_batch, pending_fu2_batch = [], []
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.answer()
-
-    if not fu1_usernames and not fu2_usernames:
-        await callback.message.answer("Нечего отмечать.", reply_markup=main_menu_kb())
-        return
-
-    await state.clear()
-    await state.update_data(fu1_usernames=fu1_usernames, fu2_usernames=fu2_usernames)
-    if fu1_usernames:
-        await prompt_choose_message(
-            callback.message, state, purpose="followup_fu1", fu_stage="fu1",
-            title=f"Какой текст FU1 отправлен? (лидов: {len(fu1_usernames)})",
-        )
-    else:
-        await prompt_choose_message(
-            callback.message, state, purpose="followup_fu2", fu_stage="fu2",
-            title=f"Какой текст FU2 отправлен? (лидов: {len(fu2_usernames)})",
-        )
-
-
-# ---------------------------------------------------------------------------
-# /msg_leads — присвоить сообщение группе лидов (статус и дата НЕ меняются)
+# /msg_leads, /change_status, /change_date, /fu_leads — массовые операции текстом
 # ---------------------------------------------------------------------------
 
 @router.message(Command("msg_leads"))
@@ -902,70 +607,46 @@ async def cmd_msg_leads(message: Message, state: FSMContext) -> None:
 
 @router.message(Form.msg_leads_range)
 async def msg_leads_range_input(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    msguse_message_id = data.get("msguse_message_id")
     text_value = (message.text or "").strip()
     leads = await resolve_leads_selector(message, state, text_value)
     if leads is None:
         return
     usernames = [l.username for l in leads]
+
+    if msguse_message_id:
+        # пришли сюда с кнопки «✅ Использовать» на карточке сообщения — сообщение уже выбрано
+        await state.clear()
+        count = await db.assign_message_only(usernames, msguse_message_id)
+        msg = await db.get_message(msguse_message_id)
+        await message.answer(
+            f"✅ Сообщение присвоено {count} лидам: {msg.title if msg else ''}",
+            reply_markup=kb.main_menu_kb(),
+        )
+        return
+
+    # обычный /msg_leads — дальше спрашиваем, какое сообщение отправлено
     await state.update_data(usernames=usernames, selector_text=text_value)
-    await prompt_choose_message(message, state, purpose="msg_leads")
+    await prompt_choose_message(message, state, purpose="msg_leads", category="initial",
+                                 title="Какое сообщение отправлено?")
 
 
 @router.callback_query(F.data == "confirm:msg_leads_apply")
 async def cb_confirm_msg_leads(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     usernames = data.get("usernames") or []
-    message_label = data.get("message_label")
+    message_id = data.get("message_id")
+    title = data.get("message_title", "")
     await state.clear()
     await callback.message.edit_reply_markup(reply_markup=None)
-    if not usernames or not message_label:
+    if not usernames or not message_id:
         await callback.answer("Данные устарели, начни заново.", show_alert=True)
         return
-    count = await db.assign_message_only(usernames, message_label)
-    await callback.message.answer(f"✅ Сообщение присвоено {count} лидам: «{message_label}»")
+    count = await db.assign_message_only(usernames, message_id)
+    await callback.message.answer(f"✅ Сообщение присвоено {count} лидам: {title}")
     await callback.answer()
 
-
-# ---------------------------------------------------------------------------
-# /fu_leads — присвоить текст FU1- или FU2-сообщения группе лидов (аналогично /msg_leads)
-# ---------------------------------------------------------------------------
-
-@router.message(Command("fu_leads"))
-async def cmd_fu_leads(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="FU1", callback_data="fufor:fu1"),
-        InlineKeyboardButton(text="FU2", callback_data="fufor:fu2"),
-    ]])
-    await message.answer("Для какого follow-up назначить сообщение?", reply_markup=kb)
-
-
-@router.callback_query(F.data.startswith("fufor:"))
-async def cb_fu_leads_stage(callback: CallbackQuery, state: FSMContext) -> None:
-    fu_stage = callback.data.split(":", 1)[1]
-    await state.set_state(Form.fu_leads_selector)
-    await state.update_data(fu_stage=fu_stage)
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer("Каких лидов отметить?\nПримеры: 5   5-20   5, 7, 10")
-    await callback.answer()
-
-
-@router.message(Form.fu_leads_selector)
-async def fu_leads_selector_input(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    fu_stage = data.get("fu_stage")
-    text_value = (message.text or "").strip()
-    leads = await resolve_leads_selector(message, state, text_value)
-    if leads is None:
-        return
-    usernames = [l.username for l in leads]
-    await prompt_choose_message(message, state, purpose="fu_leads", fu_stage=fu_stage)
-    await state.update_data(usernames=usernames)
-
-
-# ---------------------------------------------------------------------------
-# /change_status — массовая смена статуса
-# ---------------------------------------------------------------------------
 
 @router.message(Command("change_status"))
 async def cmd_change_status(message: Message, state: FSMContext) -> None:
@@ -980,9 +661,9 @@ async def change_status_selector_input(message: Message, state: FSMContext) -> N
     if leads is None:
         return
     usernames = [l.username for l in leads]
-    await state.clear()  # выбор статуса дальше идёт через callback, отдельное состояние не нужно
+    await state.clear()
     await state.update_data(usernames=usernames)
-    await message.answer(f"Выбрано лидов: {len(usernames)}\nНовый статус:", reply_markup=bulk_status_kb())
+    await message.answer(f"Выбрано лидов: {len(usernames)}\nНовый статус:", reply_markup=kb.bulk_status_kb())
 
 
 @router.callback_query(F.data.startswith("bulkstatus:"))
@@ -1004,10 +685,6 @@ async def cb_bulk_status(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
-# ---------------------------------------------------------------------------
-# /change_date — массовая смена даты первой отправки (статус НЕ меняется)
-# ---------------------------------------------------------------------------
-
 @router.message(Command("change_date"))
 async def cmd_change_date(message: Message, state: FSMContext) -> None:
     await state.set_state(Form.change_date_selector)
@@ -1024,10 +701,8 @@ async def change_date_selector_input(message: Message, state: FSMContext) -> Non
     await state.update_data(usernames=usernames)
     await state.set_state(Form.change_date_value)
     await message.answer(
-        f"Выбрано лидов: {len(usernames)}\n"
-        "Новая дата первой отправки?\n"
-        "Формат: 28.09, 28.09.2026 или 28.09 14:00\n"
-        "FU1 и FU2 пересчитаются автоматически, статус не меняется."
+        f"Выбрано лидов: {len(usernames)}\nНовая дата первой отправки?\n"
+        "Формат: 28.09, 28.09.2026 или 28.09 14:00\nFU1 и FU2 пересчитаются, статус не меняется."
     )
 
 
@@ -1037,79 +712,361 @@ async def change_date_value_input(message: Message, state: FSMContext) -> None:
     usernames = data.get("usernames") or []
     await state.clear()
     if not usernames:
-        await message.answer("Данные устарели, начни заново.", reply_markup=main_menu_kb())
+        await message.answer("Данные устарели, начни заново.", reply_markup=kb.main_menu_kb())
         return
     new_date = parse_date_input((message.text or "").strip())
     if new_date is None:
         await message.answer("Не понял дату. Формат: 28.09, 28.09.2026 или 28.09 14:00.")
         return
     count = await db.change_message_date_bulk(usernames, new_date)
-    fu1_due = new_date + dt.timedelta(days=4)
-    fu2_due = fu1_due + dt.timedelta(days=7)
+    import datetime as _dt
+    fu1_due = new_date + _dt.timedelta(days=4)
+    fu2_due = fu1_due + _dt.timedelta(days=7)
     await message.answer(
         f"✅ Дата отправки обновлена у {count} лидов: {fmt_datetime(new_date)}\n"
         f"FU1: {fmt_date(fu1_due)} | FU2: {fmt_date(fu2_due)}",
-        reply_markup=main_menu_kb(),
+        reply_markup=kb.main_menu_kb(),
     )
 
 
-# ---------------------------------------------------------------------------
-# /note, /get_notes, /del_notes — заметки по улучшению бота (не про лидов)
-# ---------------------------------------------------------------------------
-
-@router.message(Command("note"))
-async def cmd_note(message: Message, command: CommandObject) -> None:
-    text_value = (command.args or "").strip()
-    if not text_value:
-        await message.answer("Использование: /note текст заметки")
-        return
-    await db.add_improvement_note(text_value)
-    await message.answer("📝 Заметка по улучшению сохранена.")
+@router.message(Command("fu_leads"))
+async def cmd_fu_leads(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    ikb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="FU1", callback_data="fufor:fu1"),
+        InlineKeyboardButton(text="FU2", callback_data="fufor:fu2"),
+    ]])
+    await message.answer("Для какого follow-up назначить сообщение?", reply_markup=ikb)
 
 
-@router.message(Command("get_notes"))
-async def cmd_get_notes(message: Message) -> None:
-    notes = await db.get_improvement_notes()
-    if not notes:
-        await message.answer("Заметок по улучшению пока нет.")
-        return
-    lines = ["📝 ЗАМЕТКИ ПО УЛУЧШЕНИЮ"]
-    for i, n in enumerate(notes, start=1):
-        lines.append(f"{i}. {n.text}")
-    await message.answer("\n".join(lines))
-
-
-@router.message(Command("del_notes"))
-async def cmd_del_notes(message: Message) -> None:
-    await message.answer(
-        "⚠️ Удалить ВСЕ заметки по улучшению? Действие необратимо.",
-        reply_markup=confirm_kb("del_notes"),
-    )
-
-
-@router.callback_query(F.data == "confirm:del_notes")
-async def cb_confirm_del_notes(callback: CallbackQuery) -> None:
-    count = await db.clear_improvement_notes()
+@router.callback_query(F.data.startswith("fufor:"))
+async def cb_fu_leads_stage(callback: CallbackQuery, state: FSMContext) -> None:
+    fu_stage = callback.data.split(":", 1)[1]
+    await state.set_state(Form.fu_leads_selector)
+    await state.update_data(fu_stage=fu_stage)
     await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer(f"🗑 Удалено заметок: {count}")
+    await callback.message.answer("Каких лидов отметить?\nПримеры: 5   5-20   5, 7, 10")
+    await callback.answer()
+
+
+@router.message(Form.fu_leads_selector)
+async def fu_leads_selector_input(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    fu_stage = data.get("fu_stage")
+    leads = await resolve_leads_selector(message, state, (message.text or "").strip())
+    if leads is None:
+        return
+    usernames = [l.username for l in leads]
+    await prompt_choose_message(message, state, purpose="fu_leads", category=fu_stage,
+                                 title=f"Какой текст {fu_stage.upper()} отправлен?")
+    await state.update_data(usernames=usernames, fu_stage=fu_stage)
+
+
+# ---------------------------------------------------------------------------
+# Раздел «Сообщения»
+# ---------------------------------------------------------------------------
+
+@router.message(F.text == "💬 Сообщения")
+@router.callback_query(F.data == "messages:menu")
+async def messages_menu(event) -> None:
+    text = "💬 <b>Сообщения</b>\nВыберите категорию:"
+    if isinstance(event, Message):
+        await event.answer(text, reply_markup=kb.messages_categories_kb())
+    else:
+        await event.message.edit_text(text, reply_markup=kb.messages_categories_kb())
+        await event.answer()
+
+
+@router.callback_query(F.data.startswith("msgcat:"))
+async def cb_messages_category(callback: CallbackQuery) -> None:
+    category = callback.data.split(":", 1)[1]
+    text, messages = await render_category_list(category)
+    await callback.message.edit_text(text, reply_markup=kb.messages_list_kb(messages, category))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("msgcard:"))
+async def cb_message_card(callback: CallbackQuery) -> None:
+    message_id = int(callback.data.split(":", 1)[1])
+    msg = await db.get_message(message_id)
+    if not msg:
+        await callback.answer("Сообщение не найдено", show_alert=True)
+        return
+    text = await render_message_card(msg)
+    await callback.message.edit_text(text, reply_markup=kb.message_card_kb(msg, msg.category))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("msgstats:"))
+async def cb_message_stats(callback: CallbackQuery) -> None:
+    message_id = int(callback.data.split(":", 1)[1])
+    msg = await db.get_message(message_id)
+    if not msg:
+        await callback.answer("Сообщение не найдено", show_alert=True)
+        return
+    await callback.message.answer(await render_message_full_stats(msg))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("msgarchive:"))
+async def cb_message_archive(callback: CallbackQuery) -> None:
+    message_id = int(callback.data.split(":", 1)[1])
+    await db.archive_message(message_id)
+    msg = await db.get_message(message_id)
+    await callback.message.edit_text(await render_message_card(msg), reply_markup=kb.message_card_kb(msg, msg.category))
+    await callback.answer("Сообщение архивировано")
+
+
+@router.callback_query(F.data.startswith("msguse:"))
+async def cb_message_use(callback: CallbackQuery, state: FSMContext) -> None:
+    message_id = int(callback.data.split(":", 1)[1])
+    await state.set_state(Form.msg_leads_range)
+    await state.update_data(msguse_message_id=message_id)
+    await callback.message.answer("Каким лидам присвоить это сообщение?\nПримеры: 5   5-20   5, 7, 10")
     await callback.answer()
 
 
 # ---------------------------------------------------------------------------
-# 📝 Заметки (кнопка меню) — тот же функционал, что /note, /get_notes, /del_notes
+# 📅 Follow-up
 # ---------------------------------------------------------------------------
 
-def notes_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить заметку", callback_data="notes_add")],
-        [InlineKeyboardButton(text="📋 Посмотреть заметки", callback_data="notes_view")],
-        [InlineKeyboardButton(text="🗑 Удалить все заметки", callback_data="notes_delete_all")],
-    ])
+@router.message(F.text == "📅 Follow-up")
+@router.message(Command("followup"))
+async def followups_summary(event) -> None:
+    fu1_leads, fu2_leads = await db.get_followups_due()
+    global pending_fu1_batch, pending_fu2_batch
+    pending_fu1_batch = [l.username for l in fu1_leads]
+    pending_fu2_batch = [l.username for l in fu2_leads]
+    text = f"📅 <b>Follow-up</b>\nНа сегодня:\n🔁 FU1 — {len(fu1_leads)}\n🔁 FU2 — {len(fu2_leads)}"
+    target = event if isinstance(event, Message) else event.message
+    await target.answer(text, reply_markup=kb.followup_summary_kb())
 
 
-@router.message(F.text == "📝 Заметки")
-async def notes_menu(message: Message) -> None:
-    await message.answer("📝 Заметки по улучшению", reply_markup=notes_menu_kb())
+@router.callback_query(F.data == "followup:open")
+async def cb_followup_open(callback: CallbackQuery) -> None:
+    await callback.message.edit_text(
+        f"🔁 FU1 — {len(pending_fu1_batch)} лидов\n🔁 FU2 — {len(pending_fu2_batch)} лидов",
+        reply_markup=kb.followup_detail_kb(bool(pending_fu1_batch), bool(pending_fu2_batch)),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "followup:list")
+async def cb_followup_list(callback: CallbackQuery) -> None:
+    lines = ["📄 Список на сегодня:"]
+    if pending_fu1_batch:
+        lines.append("FU1: " + ", ".join(f"@{u}" for u in pending_fu1_batch))
+    if pending_fu2_batch:
+        lines.append("FU2: " + ", ".join(f"@{u}" for u in pending_fu2_batch))
+    if not pending_fu1_batch and not pending_fu2_batch:
+        lines.append("Пусто.")
+    await callback.message.answer("\n".join(lines))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("followup:send:"))
+async def cb_followup_send(callback: CallbackQuery, state: FSMContext) -> None:
+    stage = callback.data.split(":", 2)[2]
+    usernames = pending_fu1_batch if stage == "fu1" else pending_fu2_batch
+    if not usernames:
+        await callback.answer("Список пуст.", show_alert=True)
+        return
+    await state.clear()
+    if stage == "fu1":
+        await state.update_data(fu1_usernames=usernames, fu2_usernames=[])
+        purpose = "followup_fu1"
+    else:
+        await state.update_data(fu1_usernames=[], fu2_usernames=usernames)
+        purpose = "followup_fu2"
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await prompt_choose_message(callback.message, state, purpose=purpose, category=stage,
+                                 title=f"Какой текст {stage.upper()} отправлен? (лидов: {len(usernames)})")
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# 📄 Вся база (постранично, редактирование сообщения — как в V1)
+# ---------------------------------------------------------------------------
+
+async def render_leads_page(page: int) -> tuple[str, kb.InlineKeyboardMarkup | None]:
+    total = await db.count_leads()
+    if total == 0:
+        return "📄 <b>ВСЯ БАЗА</b>\nБаза пока пуста.", None
+    total_pages = (total + LEADS_PER_PAGE - 1) // LEADS_PER_PAGE
+    page = max(1, min(page, total_pages))
+    offset = (page - 1) * LEADS_PER_PAGE
+    leads = await db.get_leads_page(offset, LEADS_PER_PAGE)
+    blocks = [await lead_list_block(offset + i, lead) for i, lead in enumerate(leads, start=1)]
+    text = (
+        f"📄 <b>ВСЯ БАЗА</b>\n<b>Страница {page} из {total_pages}</b>\n"
+        f"Показано: {offset + 1}–{offset + len(leads)} из {total}\n\n" + "\n\n".join(blocks)
+    )
+    return text, kb.build_pagination_kb(page, total_pages)
+
+
+@router.callback_query(F.data == "leads:all")
+async def cb_leads_all(callback: CallbackQuery) -> None:
+    text, markup = await render_leads_page(1)
+    await callback.message.edit_text(text, reply_markup=markup or kb.leads_menu_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("leads_page:"))
+async def cb_leads_page(callback: CallbackQuery) -> None:
+    page = int(callback.data.split(":", 1)[1])
+    text, markup = await render_leads_page(page)
+    await callback.message.edit_text(text, reply_markup=markup)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "noop")
+async def cb_noop(callback: CallbackQuery) -> None:
+    await callback.answer()
+
+
+@router.message(F.text.regexp(r"^/(\d+)$"))
+async def open_lead_by_number(message: Message) -> None:
+    num = int(message.text[1:])
+    lead = await db.get_lead_by_position(num)
+    if not lead:
+        await message.answer("⚠️ Такого номера нет.")
+        return
+    await message.answer(await lead_card_text(lead), reply_markup=kb.status_kb(lead))
+
+
+# ---------------------------------------------------------------------------
+# 📊 Статистика
+# ---------------------------------------------------------------------------
+
+@router.message(F.text == "📊 Статистика")
+@router.message(Command("stats"))
+async def stats_menu(event) -> None:
+    text = await stats_mod.render_overall_stats("all")
+    target = event if isinstance(event, Message) else event.message
+    if isinstance(event, Message):
+        await target.answer(text, reply_markup=kb.stats_period_kb())
+    else:
+        await target.edit_text(text, reply_markup=kb.stats_period_kb())
+        await event.answer()
+
+
+@router.callback_query(F.data == "stats:menu")
+async def cb_stats_menu(callback: CallbackQuery) -> None:
+    text = await stats_mod.render_overall_stats("all")
+    await callback.message.edit_text(text, reply_markup=kb.stats_period_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("statsperiod:"))
+async def cb_stats_period(callback: CallbackQuery) -> None:
+    code = callback.data.split(":", 1)[1]
+    text = await stats_mod.render_overall_stats(code)
+    await callback.message.edit_text(text, reply_markup=kb.stats_period_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "stats:bymessage")
+async def cb_stats_bymessage(callback: CallbackQuery) -> None:
+    await callback.message.edit_text("💬 По какой категории сообщений?", reply_markup=kb.stats_by_message_categories_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("statsmsgcat:"))
+async def cb_stats_msgcat(callback: CallbackQuery) -> None:
+    category = callback.data.split(":", 1)[1]
+    _, messages = await render_category_list(category)
+    if not messages:
+        await callback.answer("В этой категории пока нет сообщений.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        f"Выбери сообщение категории «{db.CATEGORY_LABELS.get(category)}»:",
+        reply_markup=kb.messages_list_kb(messages, category),
+    )
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# 💾 Бэкап
+# ---------------------------------------------------------------------------
+
+@router.message(F.text == "💾 Бэкап")
+@router.callback_query(F.data == "backup:menu")
+async def backup_menu(event) -> None:
+    history = await backup_mod.list_backups(1)
+    last = history[0] if history else None
+    text = "💾 <b>Бэкап</b>\n"
+    text += f"Последний: {fmt_datetime(last.created_at)} ({last.kind})" if last else "Бэкапов пока не было."
+    target_answer = event.answer if isinstance(event, Message) else event.message.edit_text
+    await target_answer(text, reply_markup=kb.backup_menu_kb())
+    if not isinstance(event, Message):
+        await event.answer()
+
+
+@router.callback_query(F.data == "backup:create")
+async def cb_backup_create(callback: CallbackQuery) -> None:
+    await callback.answer("Создаю бэкап...")
+    db_path, xlsx_path, count = await backup_mod.create_backup(kind="manual")
+    await callback.message.answer(f"✅ Бэкап создан\nЛидов: {count}\nДата: {fmt_datetime(moscow_now())}")
+    from aiogram.types import FSInputFile
+    await callback.message.answer_document(FSInputFile(db_path))
+    await callback.message.answer_document(FSInputFile(xlsx_path))
+
+
+@router.callback_query(F.data == "backup:history")
+async def cb_backup_history(callback: CallbackQuery) -> None:
+    history = await backup_mod.list_backups(10)
+    if not history:
+        await callback.answer("Бэкапов пока нет.", show_alert=True)
+        return
+    await callback.message.edit_text("🕘 История бэкапов:", reply_markup=kb.backup_history_kb(history))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("backup:restore_ask:"))
+async def cb_backup_restore_ask(callback: CallbackQuery) -> None:
+    backup_id = int(callback.data.split(":", 2)[2])
+    await callback.message.answer(
+        f"⚠️ Восстановить базу из этого бэкапа? Текущая база будет предварительно сохранена отдельно.",
+        reply_markup=kb.confirm_kb(f"restore:{backup_id}"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("confirm:restore:"))
+async def cb_confirm_restore(callback: CallbackQuery) -> None:
+    backup_id = int(callback.data.split(":", 2)[2])
+    history = await backup_mod.list_backups(50)
+    match = next((b for b in history if b.id == backup_id), None)
+    await callback.message.edit_reply_markup(reply_markup=None)
+    if not match:
+        await callback.message.answer("Бэкап не найден.")
+        await callback.answer()
+        return
+    ok, info = await backup_mod.restore_backup(match.file_path)
+    await callback.message.answer(f"{'✅' if ok else '⚠️'} {info}")
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# ⚙️ Другое + заметки по улучшению
+# ---------------------------------------------------------------------------
+
+@router.message(F.text == "⚙️ Другое")
+@router.callback_query(F.data == "other:menu")
+async def other_menu(event) -> None:
+    text = "⚙️ Другое"
+    if isinstance(event, Message):
+        await event.answer(text, reply_markup=kb.other_menu_kb())
+    else:
+        await event.message.edit_text(text, reply_markup=kb.other_menu_kb())
+        await event.answer()
+
+
+@router.callback_query(F.data == "notes:menu")
+async def cb_notes_menu(callback: CallbackQuery) -> None:
+    await callback.message.edit_text("📝 Заметки по улучшению", reply_markup=kb.notes_menu_kb())
+    await callback.answer()
 
 
 @router.callback_query(F.data == "notes_add")
@@ -1124,158 +1081,84 @@ async def improvement_note_save(message: Message, state: FSMContext) -> None:
     await state.clear()
     text_value = (message.text or "").strip()
     if not text_value:
-        await message.answer("Пустая заметка не сохранена.", reply_markup=main_menu_kb())
+        await message.answer("Пустая заметка не сохранена.", reply_markup=kb.main_menu_kb())
         return
     await db.add_improvement_note(text_value)
-    await message.answer("📝 Заметка по улучшению сохранена.", reply_markup=main_menu_kb())
+    await message.answer("📝 Заметка сохранена.", reply_markup=kb.main_menu_kb())
 
 
 @router.callback_query(F.data == "notes_view")
 async def cb_notes_view(callback: CallbackQuery) -> None:
     notes = await db.get_improvement_notes()
     if not notes:
-        await callback.message.answer("Заметок по улучшению пока нет.")
-        await callback.answer()
-        return
-    lines = ["📝 ЗАМЕТКИ ПО УЛУЧШЕНИЮ"]
-    for i, n in enumerate(notes, start=1):
-        lines.append(f"{i}. {n.text}")
-    await callback.message.answer("\n".join(lines))
+        await callback.message.answer("Заметок пока нет.")
+    else:
+        lines = ["📝 ЗАМЕТКИ ПО УЛУЧШЕНИЮ"] + [f"{i}. {n.text}" for i, n in enumerate(notes, start=1)]
+        await callback.message.answer("\n".join(lines))
     await callback.answer()
 
 
 @router.callback_query(F.data == "notes_delete_all")
 async def cb_notes_delete_all(callback: CallbackQuery) -> None:
-    await callback.message.answer(
-        "⚠️ Удалить ВСЕ заметки по улучшению? Действие необратимо.",
-        reply_markup=confirm_kb("del_notes"),
-    )
+    await callback.message.answer("⚠️ Удалить ВСЕ заметки? Необратимо.", reply_markup=kb.confirm_kb("del_notes"))
     await callback.answer()
 
 
-# ---------------------------------------------------------------------------
-# 📊 Статистика (/stats)
-# ---------------------------------------------------------------------------
-
-@router.message(F.text == "📊 Статистика")
-@router.message(Command("stats"))
-async def stats(message: Message, state: FSMContext) -> None:
-    s = await db.get_stats()
-    lines = ["📊 ОБЩАЯ СТАТИСТИКА", f"Всего лидов: {s['total']}"]
-    for status in db.ALL_STATUSES:
-        lines.append(f"{status}: {s['by_status'][status]}")
-    await message.answer("\n".join(lines), reply_markup=main_menu_kb())
-
-    messages = await db.get_all_messages()
-    if not messages:
-        return
-
-    await state.set_state(Form.stats_message_choice)
-    await state.update_data(messages=messages)
-    lines2 = ["По какому сообщению показать статистику?", ""]
-    for i, m in enumerate(messages, start=1):
-        lines2.append(f"{i}. {m}")
-    await message.answer("\n".join(lines2))
-
-
-@router.message(Form.stats_message_choice)
-async def stats_message_pick(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    messages = data.get("messages") or []
-    await state.clear()
-    text_value = (message.text or "").strip()
-    if not text_value.isdigit() or not (1 <= int(text_value) <= len(messages)):
-        await message.answer("Не понял номер. Открой «📊 Статистика» ещё раз, если нужно.", reply_markup=main_menu_kb())
-        return
-    chosen = messages[int(text_value) - 1]
-    s = await db.get_message_stats(chosen)
-    lines = [
-        "📊 СТАТИСТИКА",
-        "Сообщение:",
-        f"«{chosen}»",
-        f"Отправлено: {s['total']}",
-    ]
-    for status in (db.STATUS_REPLIED, db.STATUS_INTEREST, db.STATUS_CLIENT, db.STATUS_REJECT, db.STATUS_ARCHIVE):
-        lines.append(f"{status}: {s['by_status'][status]}")
-    await message.answer("\n".join(lines), reply_markup=main_menu_kb())
-
-
-# ---------------------------------------------------------------------------
-# 📋 Показать всю базу (постранично, с редактированием сообщения) — НЕ МЕНЯЕТСЯ
-# ---------------------------------------------------------------------------
-
-async def render_leads_page(page: int) -> tuple[str, Optional[InlineKeyboardMarkup]]:
-    """Собирает текст и клавиатуру для страницы `page` (1-based). Ничего не отправляет."""
-    total = await db.count_leads()
-    if total == 0:
-        return "📋 <b>ВСЯ БАЗА</b>\nБаза пока пуста.\nДобавь первых лидов, чтобы они появились здесь.", None
-
-    total_pages = (total + LEADS_PER_PAGE - 1) // LEADS_PER_PAGE
-    page = max(1, min(page, total_pages))
-    offset = (page - 1) * LEADS_PER_PAGE
-
-    leads = await db.get_leads_page(offset, LEADS_PER_PAGE)
-    blocks = [lead_list_block(offset + i, lead) for i, lead in enumerate(leads, start=1)]
-
-    text_value = (
-        f"📋 <b>ВСЯ БАЗА</b>\n"
-        f"<b>Страница {page} из {total_pages}</b>\n"
-        f"Показано: {offset + 1}–{offset + len(leads)} из {total}\n\n"
-        + "\n\n".join(blocks)
-    )
-    return text_value, build_pagination_kb(page, total_pages)
-
-
-@router.message(F.text == "📋 Показать всю базу")
-async def all_leads_show(message: Message) -> None:
-    text_value, kb = await render_leads_page(1)
-    await message.answer(text_value, reply_markup=kb or main_menu_kb())
-
-
-@router.callback_query(F.data.startswith("leads_page:"))
-async def cb_leads_page(callback: CallbackQuery) -> None:
-    page = int(callback.data.split(":", 1)[1])
-    text_value, kb = await render_leads_page(page)
-    await callback.message.edit_text(text_value, reply_markup=kb)
+@router.callback_query(F.data == "confirm:del_notes")
+async def cb_confirm_del_notes(callback: CallbackQuery) -> None:
+    count = await db.clear_improvement_notes()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(f"🗑 Удалено заметок: {count}")
     await callback.answer()
 
 
-@router.callback_query(F.data == "noop")
-async def cb_noop(callback: CallbackQuery) -> None:
-    await callback.answer()
-
-
-@router.message(F.text.regexp(r"^/(\d+)$"))
-async def open_lead_by_number(message: Message) -> None:
-    num = int(message.text[1:])
-    lead = await db.get_lead_by_position(num)
-    if not lead:
-        await message.answer("⚠️ Такого номера нет. Сначала открой «📋 Показать всю базу».")
+@router.message(Command("note"))
+async def cmd_note(message: Message, command: CommandObject) -> None:
+    text_value = (command.args or "").strip()
+    if not text_value:
+        await message.answer("Использование: /note текст заметки")
         return
-    await message.answer(lead_card_text(lead), reply_markup=status_kb(lead))
+    await db.add_improvement_note(text_value)
+    await message.answer("📝 Заметка сохранена.")
+
+
+@router.message(Command("get_notes"))
+async def cmd_get_notes(message: Message) -> None:
+    notes = await db.get_improvement_notes()
+    if not notes:
+        await message.answer("Заметок пока нет.")
+        return
+    lines = ["📝 ЗАМЕТКИ ПО УЛУЧШЕНИЮ"] + [f"{i}. {n.text}" for i, n in enumerate(notes, start=1)]
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("del_notes"))
+async def cmd_del_notes(message: Message) -> None:
+    await message.answer("⚠️ Удалить ВСЕ заметки? Необратимо.", reply_markup=kb.confirm_kb("del_notes"))
 
 
 # ---------------------------------------------------------------------------
-# Свободный текст: быстрая смена статуса ИЛИ добавление лидов
+# Свободный текст: быстрая смена статуса ИЛИ добавление лидов (в самом конце!)
 # ---------------------------------------------------------------------------
 
-QUICK_STATUS_RE = re.compile(
+import re as _re
+
+QUICK_STATUS_RE = _re.compile(
     r"^@?([A-Za-z0-9_]{5,32})\s+(" + "|".join(db.QUICK_STATUS_WORDS.keys()) + r")$",
-    re.IGNORECASE,
+    _re.IGNORECASE,
 )
 
 
 @router.message(F.text)
+@router.message(F.text)
 async def free_text(message: Message) -> None:
     text_value = (message.text or "").strip()
 
-    # 1) быстрая смена статуса: "@username слово"
     match = QUICK_STATUS_RE.match(text_value)
     if match:
         username, word = match.group(1), match.group(2).lower()
         status = db.QUICK_STATUS_WORDS[word]
-        lead = await db.find_lead(username)
-        if not lead:
+        if not await db.find_lead(username):
             await message.answer(f"⚠️ @{username} не найден в базе.")
             return
         await db.set_status(username, status)
@@ -1283,33 +1166,57 @@ async def free_text(message: Message) -> None:
         await message.answer(f"Статус @{username} изменён: {status_display(lead)}")
         return
 
-    # 2) список username (в т.ч. ссылки) -> добавление лидов
     usernames = extract_usernames(text_value)
     if usernames:
         await process_add_leads(message, usernames)
         return
 
-    await message.answer(
-        "Не понял сообщение. Пришли список @username, или используй меню.",
-        reply_markup=main_menu_kb(),
-    )
+    await message.answer("Не понял сообщение. Используй меню ниже.", reply_markup=kb.main_menu_kb())
+
+
+# ---------------------------------------------------------------------------
+# Фоновые задачи: авто-архив, ежедневный бэкап 03:00, ежедневный Follow-up 09:00
+# ---------------------------------------------------------------------------
+
+async def periodic_auto_archive() -> None:
+    while True:
+        try:
+            archived = await db.auto_archive_check()
+            if archived:
+                logger.info(f"Автоархив: {archived}")
+        except Exception:
+            logger.exception("Ошибка авто-архивации")
+        await asyncio.sleep(3600)
+
+
+async def daily_backup_task() -> None:
+    while True:
+        await asyncio.sleep(seconds_until(3, 0))
+        try:
+            await backup_mod.create_backup(kind="auto")
+            logger.info("Автоматический бэкап создан")
+        except Exception:
+            logger.exception("Ошибка автоматического бэкапа")
+
+
+async def daily_followup_task(bot: Bot) -> None:
+    while True:
+        await asyncio.sleep(seconds_until(9, 0))
+        try:
+            fu1_leads, fu2_leads = await db.get_followups_due()
+            global pending_fu1_batch, pending_fu2_batch
+            pending_fu1_batch = [l.username for l in fu1_leads]
+            pending_fu2_batch = [l.username for l in fu2_leads]
+            if fu1_leads or fu2_leads:
+                text = f"📅 <b>Follow-up на сегодня</b>\n🔁 FU1 — {len(fu1_leads)}\n🔁 FU2 — {len(fu2_leads)}"
+                await bot.send_message(ADMIN_ID, text, reply_markup=kb.followup_summary_kb())
+        except Exception:
+            logger.exception("Ошибка ежедневного Follow-up")
 
 
 # ---------------------------------------------------------------------------
 # Точка входа
 # ---------------------------------------------------------------------------
-
-async def periodic_auto_archive() -> None:
-    """Регулярная проверка 14/7-дневной архивации — переживает перезапуск (запускается и при старте)."""
-    while True:
-        try:
-            archived = await db.auto_archive_check()
-            if archived:
-                logger.info(f"Автоархив: перенесено в 📦 Архив — {archived}")
-        except Exception:
-            logger.exception("Ошибка авто-архивации")
-        await asyncio.sleep(3600)
-
 
 async def main() -> None:
     if not BOT_TOKEN:
@@ -1318,18 +1225,15 @@ async def main() -> None:
         raise RuntimeError("ADMIN_ID не задан в .env")
 
     await db.init_db()
-    await db.auto_archive_check()  # проверка сразу при старте — не зависит только от фонового таймера
-    asyncio.create_task(periodic_auto_archive())
+    await db.auto_archive_check()
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
 
-    # Все реальные хендлеры бота живут в `router` и доступны только ADMIN_ID.
     router.message.filter(F.from_user.id == ADMIN_ID)
     router.callback_query.filter(F.from_user.id == ADMIN_ID)
     dp.include_router(router)
 
-    # Для всех остальных пользователей — простой отказ, без доступа к логике бота.
     fallback_router = Router()
 
     @fallback_router.message()
@@ -1342,7 +1246,11 @@ async def main() -> None:
 
     dp.include_router(fallback_router)
 
-    logger.info("Бот запущен")
+    asyncio.create_task(periodic_auto_archive())
+    asyncio.create_task(daily_backup_task())
+    asyncio.create_task(daily_followup_task(bot))
+
+    logger.info("Бот запущен (V2)")
     await dp.start_polling(bot)
 
 
