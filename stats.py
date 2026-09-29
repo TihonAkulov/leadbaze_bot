@@ -27,7 +27,7 @@ async def render_overall_stats(period_code: str = "all") -> str:
         "📊 <b>СТАТИСТИКА</b>",
         f"Период: {PERIOD_LABELS.get(period_code, 'Всё время')}",
         "",
-        f"✉️ Отправлено: {s['by_status'][db.STATUS_SENT] + s['by_status'][db.STATUS_REPLIED] + s['by_status'][db.STATUS_INTEREST] + s['by_status'][db.STATUS_CLIENT] + s['by_status'][db.STATUS_REJECT] + s['by_status'][db.STATUS_ARCHIVE]}",
+        f"✉️ Отправлено: {s['sent_total']}",
         f"💬 Ответили: {s['by_status'][db.STATUS_REPLIED]}",
         f"🔥 Интерес: {s['by_status'][db.STATUS_INTEREST]}",
         f"🤝 Клиенты: {s['by_status'][db.STATUS_CLIENT]}",
@@ -41,9 +41,8 @@ async def render_overall_stats(period_code: str = "all") -> str:
         lines.append("🏆 Лучшее сообщение:")
         lines.append(f"«{short(msg.content, 50)}»")
 
-    sent_total = s['by_status'][db.STATUS_SENT] + s['by_status'][db.STATUS_REPLIED] + s['by_status'][db.STATUS_INTEREST] + s['by_status'][db.STATUS_CLIENT] + s['by_status'][db.STATUS_REJECT] + s['by_status'][db.STATUS_ARCHIVE]
     clients_total = s['by_status'][db.STATUS_CLIENT]
-    conv = f"{clients_total / sent_total * 100:.1f}".replace(".", ",") + "%" if sent_total else "—"
+    conv = f"{clients_total / s['sent_total'] * 100:.1f}".replace(".", ",") + "%" if s['sent_total'] else "—"
     lines.append("")
     lines.append(f"Конверсия в клиента: {conv}")
     return "\n".join(lines)

@@ -281,7 +281,6 @@ def backup_history_kb(backups: list[db.Backup]) -> InlineKeyboardMarkup:
 def other_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📝 Заметки", callback_data="notes:menu")],
-        [InlineKeyboardButton(text="🛠 Улучшения", callback_data="notes:menu")],
         [InlineKeyboardButton(text="❓ Помощь", callback_data="other:help")],
         [InlineKeyboardButton(text="🗑 Очистить базу", callback_data="other:clear_db")],
     ])

@@ -54,6 +54,7 @@ ENGAGED_STATUSES = (STATUS_SENT, STATUS_REPLIED, STATUS_INTEREST, STATUS_CLIENT)
 ARCHIVE_ELIGIBLE_STATUS = STATUS_SENT
 
 CATEGORY_LABELS = {"initial": "Первое сообщение", "fu1": "FU1", "fu2": "FU2"}
+MESSAGE_TITLE_PREFIX = {"initial": "fst", "fu1": "fu1", "fu2": "fu2"}
 
 # ---------------------------------------------------------------------------
 # Подключение
@@ -466,9 +467,10 @@ async def get_or_create_message(category: str, content: str) -> Message:
         count = await session.scalar(
             select(func.count(Message.id)).where(Message.category == category)
         ) or 0
+        prefix = MESSAGE_TITLE_PREFIX.get(category, category)
         msg = Message(
             category=category,
-            title=f"N{count + 1}",
+            title=f"#{prefix}_{count + 1}",
             content=content,
             active=True,
             last_used_at=moscow_now(),
@@ -538,27 +540,45 @@ def _period_filter(column, period: Optional[tuple[dt.datetime, dt.datetime]]):
 
 async def get_stats(period: Optional[tuple[dt.datetime, dt.datetime]] = None) -> dict:
     async with async_session() as session:
-        base = select(func.count(Lead.id))
         cond = _period_filter(Lead.message_sent_at, period)
-        total = await session.scalar(base if cond is None else base.where(cond)) or 0
+
+        total = await session.scalar(select(func.count(Lead.id))) or 0
+
+        # "реально отправлено" — по факту наличия message_sent_at, а не по сумме отдельных
+        # статусов (так в подсчёт честно попадают и 🚫 Бан, и 🗑 Удалено — им тоже отправляли)
+        sent_q = select(func.count(Lead.id)).where(Lead.message_sent_at.is_not(None))
+        if cond is not None:
+            sent_q = sent_q.where(cond)
+        sent_total = await session.scalar(sent_q) or 0
+
         by_status = {}
         for status in ALL_STATUSES:
             q = select(func.count(Lead.id)).where(Lead.status == status)
             if cond is not None:
                 q = q.where(cond)
             by_status[status] = await session.scalar(q) or 0
-    return {"total": total, "by_status": by_status}
+    return {"total": total, "sent_total": sent_total, "by_status": by_status}
 
 
 async def get_message_stats(message_id: int) -> dict:
     async with async_session() as session:
+        msg = await session.get(Message, message_id)
+        if not msg:
+            return {"total": 0, "by_status": {s: 0 for s in (STATUS_REPLIED, STATUS_INTEREST, STATUS_CLIENT, STATUS_REJECT, STATUS_ARCHIVE)}}
+
+        column = {
+            "initial": Lead.message_id,
+            "fu1": Lead.fu1_message_id,
+            "fu2": Lead.fu2_message_id,
+        }[msg.category]
+
         total = await session.scalar(
-            select(func.count(Lead.id)).where(Lead.message_id == message_id)
+            select(func.count(Lead.id)).where(column == message_id)
         ) or 0
         by_status = {}
         for status in (STATUS_REPLIED, STATUS_INTEREST, STATUS_CLIENT, STATUS_REJECT, STATUS_ARCHIVE):
             by_status[status] = await session.scalar(
-                select(func.count(Lead.id)).where(Lead.message_id == message_id, Lead.status == status)
+                select(func.count(Lead.id)).where(column == message_id, Lead.status == status)
             ) or 0
     return {"total": total, "by_status": by_status}
 
