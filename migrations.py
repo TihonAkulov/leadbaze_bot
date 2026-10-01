@@ -22,7 +22,17 @@ async def _old_columns_present(conn) -> set[str]:
     return {row[1] for row in result.fetchall()}
 
 
+async def _ensure_lead_events_amount_column() -> None:
+    async with db.engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(lead_events)"))
+        cols = {row[1] for row in result.fetchall()}
+        if "amount" not in cols:
+            await conn.execute(text("ALTER TABLE lead_events ADD COLUMN amount FLOAT"))
+
+
 async def migrate_old_schema() -> None:
+    await _ensure_lead_events_amount_column()
+
     async with db.engine.begin() as conn:
         cols = await _old_columns_present(conn)
 

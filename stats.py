@@ -31,6 +31,7 @@ async def render_overall_stats(period_code: str = "all") -> str:
         f"💬 Ответили: {s['by_status'][db.STATUS_REPLIED]}",
         f"🔥 Интерес: {s['by_status'][db.STATUS_INTEREST]}",
         f"🤝 Клиенты: {s['by_status'][db.STATUS_CLIENT]}",
+        f"💰 Клиент закрыт: {s['by_status'][db.STATUS_CLIENT_CLOSED]}",
         f"❌ Отказ: {s['by_status'][db.STATUS_REJECT]}",
     ]
 
@@ -39,13 +40,24 @@ async def render_overall_stats(period_code: str = "all") -> str:
         msg, sent, clients = best
         lines.append("")
         lines.append("🏆 Лучшее сообщение:")
-        lines.append(f"«{short(msg.content, 50)}»")
+        lines.append(f"🏷 {msg.title}")
 
-    clients_total = s['by_status'][db.STATUS_CLIENT]
-    conv = f"{clients_total / s['sent_total'] * 100:.1f}".replace(".", ",") + "%" if s['sent_total'] else "—"
     lines.append("")
-    lines.append(f"Конверсия в клиента: {conv}")
+    lines.append(f"📊 Конверсия в ответ: {reply_conversion_pct(s)}")
+    lines.append(f"💰 Конверсия в клиента: {client_conversion_pct(s)}")
     return "\n".join(lines)
+
+
+def conversion_pct(count: int, sent: int) -> str:
+    return f"{count / sent * 100:.2f}".replace(".", ",") + "%" if sent else "—"
+
+
+def reply_conversion_pct(s: dict) -> str:
+    return conversion_pct(s["by_status"][db.STATUS_REPLIED], s["sent_total"])
+
+
+def client_conversion_pct(s: dict) -> str:
+    return conversion_pct(s["by_status"][db.STATUS_CLIENT], s["sent_total"])
 
 
 async def render_leads_summary() -> str:

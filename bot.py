@@ -33,7 +33,7 @@ import backup as backup_mod
 import database as db
 import keyboards as kb
 import stats as stats_mod
-from messages import render_category_list, render_message_card, render_message_full_stats
+from messages import render_category_list, render_message_card
 from utils import (
     extract_usernames, fmt_date, fmt_datetime, moscow_now,
     parse_date_input, parse_position_selector, seconds_until, short,
@@ -71,6 +71,10 @@ class Form(StatesGroup):
     change_date_value = State()
     fu_leads_selector = State()
     adding_improvement_note = State()
+    change_msg_text_tag = State()
+    change_msg_text_value = State()
+    close_client_amount = State()
+    awaiting_restore_file = State()
 
 
 # ---------------------------------------------------------------------------
@@ -337,12 +341,13 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 @router.callback_query(F.data == "other:help")
 async def cmd_help(event) -> None:
     text = (
-        "👤 <b>Лиды</b> — добавить, новые, поиск, вся база\n"
-        "💬 <b>Сообщения</b> — библиотека текстов (первое/FU1/FU2), статистика по каждому\n"
-        "📅 <b>Follow-up</b> — кому сегодня писать\n"
-        "📊 <b>Статистика</b> — по периодам и по сообщениям\n"
-        "💾 <b>Бэкап</b> — .db + .xlsx, история, восстановление\n"
+        "👤 <b>Лиды</b> — добавить, новые, поиск, вся база, 🔥 тёплые (ответил/интерес/клиент)\n"
+        "📅 <b>Follow-up</b> — кому сегодня писать (и утром в 09:00 МСК — автоматически)\n"
+        "📈 <b>Статистика</b> → 💬 По сообщениям — тексты (первое/FU1/FU2) и статистика по каждому живут здесь\n"
+        "💾 <b>Бэкап</b> — .db + .xlsx, история, восстановление (можно прислать свой .db файлом)\n"
         "⚙️ <b>Другое</b> — заметки, помощь, очистка базы\n\n"
+        "💰 Клиент закрыт — отдельная кнопка на карточке лида, спросит сумму сделки\n"
+        "/change_msg_text — изменить текст сообщения по тегу (fst_1, fu1_1...), не создавая новое\n\n"
         "Быстрая смена статуса текстом: @username интерес / ответил / клиент / отказ / бан / удалено / архив\n"
         "/msg_leads, /fu_leads, /change_status, /change_date, /del@username — как раньше, текстовыми командами"
     )
@@ -764,27 +769,9 @@ async def fu_leads_selector_input(message: Message, state: FSMContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Раздел «Сообщения»
+# Сообщения — больше не отдельный раздел главного меню (V2.1): живёт только
+# внутри «📈 Статистика → 💬 По сообщениям» (см. cb_stats_bymessage / cb_stats_msgcat ниже).
 # ---------------------------------------------------------------------------
-
-@router.message(F.text == "💬 Сообщения")
-@router.callback_query(F.data == "messages:menu")
-async def messages_menu(event) -> None:
-    text = "💬 <b>Сообщения</b>\nВыберите категорию:"
-    if isinstance(event, Message):
-        await event.answer(text, reply_markup=kb.messages_categories_kb())
-    else:
-        await event.message.edit_text(text, reply_markup=kb.messages_categories_kb())
-        await event.answer()
-
-
-@router.callback_query(F.data.startswith("msgcat:"))
-async def cb_messages_category(callback: CallbackQuery) -> None:
-    category = callback.data.split(":", 1)[1]
-    text, messages = await render_category_list(category)
-    await callback.message.edit_text(text, reply_markup=kb.messages_list_kb(messages, category))
-    await callback.answer()
-
 
 @router.callback_query(F.data.startswith("msgcard:"))
 async def cb_message_card(callback: CallbackQuery) -> None:
@@ -798,14 +785,14 @@ async def cb_message_card(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("msgstats:"))
-async def cb_message_stats(callback: CallbackQuery) -> None:
+@router.callback_query(F.data.startswith("msgfulltext:"))
+async def cb_message_fulltext(callback: CallbackQuery) -> None:
     message_id = int(callback.data.split(":", 1)[1])
     msg = await db.get_message(message_id)
     if not msg:
         await callback.answer("Сообщение не найдено", show_alert=True)
         return
-    await callback.message.answer(await render_message_full_stats(msg))
+    await callback.message.answer(f"🏷 {msg.title}\n\n{msg.content}")
     await callback.answer()
 
 
@@ -825,6 +812,89 @@ async def cb_message_use(callback: CallbackQuery, state: FSMContext) -> None:
     await state.update_data(msguse_message_id=message_id)
     await callback.message.answer("Каким лидам присвоить это сообщение?\nПримеры: 5   5-20   5, 7, 10")
     await callback.answer()
+
+
+# --- /change_msg_text: правка текста БЕЗ создания нового сообщения/тега/статистики ---
+
+@router.callback_query(F.data.startswith("msgedit:"))
+async def cb_message_edit_start(callback: CallbackQuery, state: FSMContext) -> None:
+    message_id = int(callback.data.split(":", 1)[1])
+    msg = await db.get_message(message_id)
+    if not msg:
+        await callback.answer("Сообщение не найдено", show_alert=True)
+        return
+    await state.set_state(Form.change_msg_text_value)
+    await state.update_data(edit_message_id=message_id)
+    await callback.message.answer(
+        f"🏷 {msg.title}\nТекущий текст:\n«{msg.content}»\n\nОтправьте новый текст сообщения."
+    )
+    await callback.answer()
+
+
+@router.message(Command("change_msg_text"))
+async def cmd_change_msg_text(message: Message, state: FSMContext) -> None:
+    await state.set_state(Form.change_msg_text_tag)
+    await message.answer("Введите тег сообщения:\nПример: fst_1")
+
+
+@router.message(Form.change_msg_text_tag)
+async def change_msg_text_tag_input(message: Message, state: FSMContext) -> None:
+    tag = (message.text or "").strip()
+    msg = await db.get_message_by_tag(tag)
+    if not msg:
+        await message.answer("Не нашёл сообщение с таким тегом. Проверь и пришли ещё раз (например: fst_1).")
+        return
+    await state.set_state(Form.change_msg_text_value)
+    await state.update_data(edit_message_id=msg.id)
+    await message.answer(
+        f"🏷 {msg.title}\nТекущий текст:\n«{msg.content}»\n\nОтправьте новый текст сообщения."
+    )
+
+
+@router.message(Form.change_msg_text_value)
+async def change_msg_text_value_input(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    message_id = data.get("edit_message_id")
+    await state.clear()
+    new_text = (message.text or "").strip()
+    if not message_id or not new_text:
+        await message.answer("Не получилось — попробуй /change_msg_text заново.", reply_markup=kb.main_menu_kb())
+        return
+    ok = await db.change_message_content(message_id, new_text)
+    msg = await db.get_message(message_id)
+    if ok and msg:
+        await message.answer(f"✅ Текст {msg.title} обновлён. Тег и статистика сохранены.", reply_markup=kb.main_menu_kb())
+    else:
+        await message.answer("Сообщение не найдено.", reply_markup=kb.main_menu_kb())
+
+
+# --- 💰 Клиент закрыт: статус + сумма сделки ---
+
+@router.callback_query(F.data.startswith("closeclient:"))
+async def cb_close_client_start(callback: CallbackQuery, state: FSMContext) -> None:
+    username = callback.data.split(":", 1)[1]
+    await state.set_state(Form.close_client_amount)
+    await state.update_data(username=username)
+    await callback.message.answer(f"💰 Клиент закрыт\nУкажите сумму заработка с этого клиента (@{username}):")
+    await callback.answer()
+
+
+@router.message(Form.close_client_amount)
+async def close_client_amount_input(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    username = data.get("username")
+    await state.clear()
+    text_value = (message.text or "").strip().replace(" ", "").replace(",", ".")
+    try:
+        amount = float(text_value)
+    except ValueError:
+        await message.answer("Не понял сумму. Пришли число, например: 7450")
+        return
+    if not username or not await db.close_client(username, amount):
+        await message.answer("⚠️ Лид не найден.", reply_markup=kb.main_menu_kb())
+        return
+    await message.answer(f"✅ Клиент закрыт\n💰 Сумма: {amount:,.0f} ₽".replace(",", " "))
+    await send_lead_card(message, username)
 
 
 # ---------------------------------------------------------------------------
@@ -920,6 +990,40 @@ async def cb_leads_page(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
+async def render_warm_leads_page(page: int) -> tuple[str, kb.InlineKeyboardMarkup | None]:
+    """Те же ⚡«живые» лиды (Ответил/Интерес/Клиент/Клиент закрыт), без Отказа. Пагинация та же,
+    номера — сквозные, как в «Вся база» (а не 1..N по отфильтрованному списку)."""
+    total = await db.count_warm_leads()
+    if total == 0:
+        return "🔥 <b>ТЁПЛЫЕ</b>\nПока никто не ответил/не заинтересовался.", None
+    total_pages = (total + LEADS_PER_PAGE - 1) // LEADS_PER_PAGE
+    page = max(1, min(page, total_pages))
+    offset = (page - 1) * LEADS_PER_PAGE
+    leads = await db.get_warm_leads_page(offset, LEADS_PER_PAGE)
+    position_map = await db.get_position_map()
+    blocks = [await lead_list_block(position_map.get(lead.id, 0), lead) for lead in leads]
+    text = (
+        f"🔥 <b>ТЁПЛЫЕ</b>\n<b>Страница {page} из {total_pages}</b>\n"
+        f"Показано: {offset + 1}–{offset + len(leads)} из {total}\n\n" + "\n\n".join(blocks)
+    )
+    return text, kb.build_pagination_kb(page, total_pages, prefix="warm_page")
+
+
+@router.callback_query(F.data == "leads:warm")
+async def cb_leads_warm(callback: CallbackQuery) -> None:
+    text, markup = await render_warm_leads_page(1)
+    await callback.message.edit_text(text, reply_markup=markup or kb.leads_menu_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("warm_page:"))
+async def cb_warm_page(callback: CallbackQuery) -> None:
+    page = int(callback.data.split(":", 1)[1])
+    text, markup = await render_warm_leads_page(page)
+    await callback.message.edit_text(text, reply_markup=markup)
+    await callback.answer()
+
+
 @router.callback_query(F.data == "noop")
 async def cb_noop(callback: CallbackQuery) -> None:
     await callback.answer()
@@ -939,7 +1043,7 @@ async def open_lead_by_number(message: Message) -> None:
 # 📊 Статистика
 # ---------------------------------------------------------------------------
 
-@router.message(F.text == "📊 Статистика")
+@router.message(F.text == "📈 Статистика")
 @router.message(Command("stats"))
 async def stats_menu(event) -> None:
     text = await stats_mod.render_overall_stats("all")
@@ -1023,13 +1127,31 @@ async def cb_backup_history(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
+async def _restore_warning_text(new_count: int, current_count: int) -> str:
+    if new_count < current_count:
+        return (
+            f"⚠️ Внимание\nВ выбранном бэкапе {new_count} лид(ов),\n"
+            f"а в текущей базе {current_count}.\nПри восстановлении часть более новых данных "
+            f"может быть потеряна.\nТочно восстановить эту базу?"
+        )
+    return f"В бэкапе {new_count} лид(ов) (сейчас: {current_count}).\nВосстановить базу из этого файла?"
+
+
 @router.callback_query(F.data.startswith("backup:restore_ask:"))
 async def cb_backup_restore_ask(callback: CallbackQuery) -> None:
     backup_id = int(callback.data.split(":", 2)[2])
-    await callback.message.answer(
-        f"⚠️ Восстановить базу из этого бэкапа? Текущая база будет предварительно сохранена отдельно.",
-        reply_markup=kb.confirm_kb(f"restore:{backup_id}"),
-    )
+    history = await backup_mod.list_backups(50)
+    match = next((b for b in history if b.id == backup_id), None)
+    if not match:
+        await callback.answer("Бэкап не найден.", show_alert=True)
+        return
+    info = await backup_mod.validate_db_file(match.file_path)
+    if not info.get("ok"):
+        await callback.answer(f"Файл повреждён или недоступен: {info.get('error')}", show_alert=True)
+        return
+    current_count = await db.count_leads()
+    text = await _restore_warning_text(info["leads_count"], current_count)
+    await callback.message.answer(text, reply_markup=kb.confirm_kb(f"restore:{backup_id}", yes_text="♻️ Да, восстановить"))
     await callback.answer()
 
 
@@ -1044,8 +1166,73 @@ async def cb_confirm_restore(callback: CallbackQuery) -> None:
         await callback.answer()
         return
     ok, info = await backup_mod.restore_backup(match.file_path)
-    await callback.message.answer(f"{'✅' if ok else '⚠️'} {info}")
+    if ok:
+        new_count = await db.count_leads()
+        await callback.message.answer(f"✅ База успешно восстановлена.\nЛидов: {new_count}")
+    else:
+        await callback.message.answer(f"⚠️ {info}")
     await callback.answer()
+
+
+# --- восстановление из загруженного файла ---
+
+@router.callback_query(F.data == "backup:restore")
+async def cb_backup_restore_upload_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(Form.awaiting_restore_file)
+    await callback.message.answer("Пришли файл базы (.db) для восстановления.\nExcel для восстановления не подходит.")
+    await callback.answer()
+
+
+@router.message(Form.awaiting_restore_file, F.document)
+async def restore_file_received(message: Message, state: FSMContext, bot: Bot) -> None:
+    doc = message.document
+    await state.clear()
+    if not doc.file_name or not doc.file_name.lower().endswith(".db"):
+        await message.answer("Нужен файл с расширением .db (не Excel).", reply_markup=kb.main_menu_kb())
+        return
+
+    os.makedirs("/tmp/leadbot_restore", exist_ok=True)
+    tmp_path = f"/tmp/leadbot_restore/{doc.file_unique_id}.db"
+    file = await bot.get_file(doc.file_id)
+    await bot.download_file(file.file_path, tmp_path)
+
+    info = await backup_mod.validate_db_file(tmp_path)
+    if not info.get("ok"):
+        await message.answer(f"⚠️ Файл не похож на корректную базу ЛидБазы: {info.get('error')}", reply_markup=kb.main_menu_kb())
+        return
+
+    current_count = await db.count_leads()
+    await state.update_data(restore_path=tmp_path)
+    text = await _restore_warning_text(info["leads_count"], current_count)
+    await message.answer(text, reply_markup=kb.confirm_kb("restore_upload", yes_text="♻️ Да, восстановить"))
+
+
+@router.message(Form.awaiting_restore_file)
+async def restore_file_wrong_type(message: Message) -> None:
+    await message.answer("Пришли именно файл (.db), не текст.")
+
+
+@router.callback_query(F.data == "confirm:restore_upload")
+async def cb_confirm_restore_upload(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    path = data.get("restore_path")
+    await state.clear()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    if not path or not os.path.exists(path):
+        await callback.message.answer("Файл уже недоступен, пришли его заново.")
+        await callback.answer()
+        return
+    ok, info = await backup_mod.restore_backup(path)
+    if ok:
+        new_count = await db.count_leads()
+        await callback.message.answer(f"✅ База успешно восстановлена.\nЛидов: {new_count}")
+    else:
+        await callback.message.answer(f"⚠️ {info}")
+    await callback.answer()
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1149,7 +1336,6 @@ QUICK_STATUS_RE = _re.compile(
 )
 
 
-@router.message(F.text)
 @router.message(F.text)
 async def free_text(message: Message) -> None:
     text_value = (message.text or "").strip()

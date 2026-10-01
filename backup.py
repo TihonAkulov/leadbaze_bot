@@ -87,21 +87,54 @@ async def list_backups(limit: int = 10) -> list[db.Backup]:
     return await db.get_backup_history(limit)
 
 
+def _validate_sync(path: str) -> dict:
+    """Проверяет, что файл — похожая на ЛидБазу SQLite-база. Без try/except наружу — ловим сами."""
+    try:
+        conn = sqlite3.connect(path)
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = {row[0] for row in cur.fetchall()}
+        if "leads" not in tables:
+            conn.close()
+            return {"ok": False, "error": "в файле нет таблицы leads — это не база ЛидБазы"}
+        cur.execute("PRAGMA table_info(leads)")
+        cols = {row[1] for row in cur.fetchall()}
+        required = {"id", "username", "status"}
+        if not required.issubset(cols):
+            conn.close()
+            return {"ok": False, "error": "в таблице leads не хватает обязательных колонок"}
+        cur.execute("SELECT COUNT(*) FROM leads")
+        count = cur.fetchone()[0]
+        conn.close()
+        return {"ok": True, "leads_count": count}
+    except Exception as e:
+        return {"ok": False, "error": f"не удалось открыть файл как SQLite-базу ({e})"}
+
+
+async def validate_db_file(path: str) -> dict:
+    """{"ok": True, "leads_count": N} либо {"ok": False, "error": "..."}."""
+    return await asyncio.to_thread(_validate_sync, path)
+
+
 async def restore_backup(file_path: str) -> tuple[bool, str]:
-    """Заменяет текущую БД файлом бэкапа. Предварительно бэкапит текущее состояние."""
+    """Заменяет текущую БД файлом бэкапа. Предварительно бэкапит текущее состояние.
+    Если защитный бэкап не удался — текущая база НЕ трогается."""
     if not os.path.exists(file_path):
         return False, "Файл бэкапа не найден на диске."
 
-    # бэкап текущего состояния перед восстановлением — на случай ошибки
-    await create_backup(kind="pre-restore")
+    try:
+        await create_backup(kind="pre-restore")
+    except Exception as e:
+        return False, f"Не удалось сделать защитный бэкап текущей базы — восстановление отменено ({e})."
 
     old_count = await db.count_leads()
 
-    await db.engine.dispose()
-    await asyncio.to_thread(_sync_sqlite_backup, file_path, db.DB_PATH)
-
-    db.engine = create_async_engine(f"sqlite+aiosqlite:///{db.DB_PATH}")
-    db.async_session = async_sessionmaker(db.engine, expire_on_commit=False)
+    try:
+        await db.engine.dispose()
+        await asyncio.to_thread(_sync_sqlite_backup, file_path, db.DB_PATH)
+    finally:
+        db.engine = create_async_engine(f"sqlite+aiosqlite:///{db.DB_PATH}")
+        db.async_session = async_sessionmaker(db.engine, expire_on_commit=False)
 
     new_count = await db.count_leads()
     return True, f"Было лидов: {old_count} -> стало: {new_count}"

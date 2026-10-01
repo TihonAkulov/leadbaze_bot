@@ -11,7 +11,7 @@ import datetime as dt
 from typing import Optional
 
 from sqlalchemy import (
-    Boolean, String, Integer, DateTime, ForeignKey, delete, select, func, text,
+    Boolean, String, Integer, DateTime, Float, ForeignKey, delete, select, func, text,
 )
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -27,21 +27,26 @@ STATUS_SENT = "🟡 Отправлено"
 STATUS_REPLIED = "💬 Ответил"
 STATUS_INTEREST = "🔥 Интерес"
 STATUS_CLIENT = "🤝 Клиент"
+STATUS_CLIENT_CLOSED = "💰 Клиент закрыт"
 STATUS_REJECT = "❌ Отказ"
 STATUS_BAN = "🚫 Бан"
 STATUS_DELETED = "🗑 Удалено"
 STATUS_ARCHIVE = "📦 Архив"
 
 ALL_STATUSES = [
-    STATUS_NEW, STATUS_SENT, STATUS_REPLIED, STATUS_INTEREST,
-    STATUS_CLIENT, STATUS_REJECT, STATUS_BAN, STATUS_DELETED, STATUS_ARCHIVE,
+    STATUS_NEW, STATUS_SENT, STATUS_REPLIED, STATUS_INTEREST, STATUS_CLIENT,
+    STATUS_CLIENT_CLOSED, STATUS_REJECT, STATUS_BAN, STATUS_DELETED, STATUS_ARCHIVE,
 ]
 
 STATUS_BY_CODE: dict[str, str] = {
     "sent": STATUS_SENT, "replied": STATUS_REPLIED, "interest": STATUS_INTEREST,
-    "client": STATUS_CLIENT, "reject": STATUS_REJECT, "ban": STATUS_BAN,
+    "client": STATUS_CLIENT, "client_closed": STATUS_CLIENT_CLOSED,
+    "reject": STATUS_REJECT, "ban": STATUS_BAN,
     "deleted": STATUS_DELETED, "archive": STATUS_ARCHIVE,
 }
+
+# «Тёплые» — те, с кем есть живой прогресс (без отказников)
+WARM_STATUSES = (STATUS_REPLIED, STATUS_INTEREST, STATUS_CLIENT, STATUS_CLIENT_CLOSED)
 
 QUICK_STATUS_WORDS: dict[str, str] = {
     "ответил": STATUS_REPLIED, "интерес": STATUS_INTEREST, "клиент": STATUS_CLIENT,
@@ -55,6 +60,10 @@ ARCHIVE_ELIGIBLE_STATUS = STATUS_SENT
 
 CATEGORY_LABELS = {"initial": "Первое сообщение", "fu1": "FU1", "fu2": "FU2"}
 MESSAGE_TITLE_PREFIX = {"initial": "fst", "fu1": "fu1", "fu2": "fu2"}
+SEND_EVENT_BY_CATEGORY = {"initial": "message_sent", "fu1": "fu1_sent", "fu2": "fu2_sent"}
+
+# статусы, для которых статистика считается исторически (по событиям, а не по текущему status)
+HISTORICAL_FUNNEL_STATUSES = (STATUS_REPLIED, STATUS_INTEREST, STATUS_CLIENT, STATUS_CLIENT_CLOSED)
 
 # ---------------------------------------------------------------------------
 # Подключение
@@ -115,6 +124,7 @@ class LeadEvent(Base):
     message_id: Mapped[Optional[int]] = mapped_column(ForeignKey("messages.id"), nullable=True)
     timestamp: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
     details: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    amount: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # сумма сделки — только для client_closed
 
 
 class ImprovementNote(Base):
@@ -228,6 +238,29 @@ async def get_leads_by_positions(positions: list[int]) -> list[Lead]:
         if lead:
             leads.append(lead)
     return leads
+
+
+async def count_warm_leads() -> int:
+    async with async_session() as session:
+        return await session.scalar(
+            select(func.count(Lead.id)).where(Lead.status.in_(WARM_STATUSES))
+        ) or 0
+
+
+async def get_warm_leads_page(offset: int, limit: int) -> list[Lead]:
+    async with async_session() as session:
+        result = await session.scalars(
+            select(Lead).where(Lead.status.in_(WARM_STATUSES))
+            .order_by(Lead.id.asc()).offset(offset).limit(limit)
+        )
+        return list(result.all())
+
+
+async def get_position_map() -> dict[int, int]:
+    """lead.id -> сквозной номер (тот же порядок, что и в «Вся база» / /номер) — для нумерации «Тёплых»."""
+    async with async_session() as session:
+        result = await session.scalars(select(Lead.id).order_by(Lead.id.asc()))
+        return {lead_id: i + 1 for i, lead_id in enumerate(result.all())}
 
 
 async def get_new_leads(limit: int) -> list[Lead]:
@@ -346,6 +379,21 @@ def _response_stage_for(lead: Lead) -> str:
     if lead.fu1_sent_at:
         return "fu1"
     return "initial"
+
+
+async def close_client(username: str, amount: float) -> bool:
+    """Переводит лида в 💰 Клиент закрыт и фиксирует сумму сделки отдельным событием."""
+    async with async_session() as session:
+        lead = await session.scalar(select(Lead).where(Lead.username == username))
+        if not lead:
+            return False
+        lead.status = STATUS_CLIENT_CLOSED
+        session.add(LeadEvent(
+            lead_id=lead.id, event_type="client_closed",
+            message_id=lead.message_id, amount=amount,
+        ))
+        await session.commit()
+        return True
 
 
 async def set_note(username: str, note: str) -> bool:
@@ -517,6 +565,24 @@ async def get_recent_messages(category: str, limit: int = 4) -> list[Message]:
         return list(result.all())
 
 
+async def get_message_by_tag(tag: str) -> Optional[Message]:
+    """tag — это title, например fst_1 (без решётки, её пользователь может не писать)."""
+    tag = tag.strip().lstrip("#")
+    async with async_session() as session:
+        return await session.scalar(select(Message).where(Message.title == f"#{tag}"))
+
+
+async def change_message_content(message_id: int, new_content: str) -> bool:
+    """Меняет ТОЛЬКО текст сообщения. Тег (title), id и вся история/статистика не трогаются."""
+    async with async_session() as session:
+        msg = await session.get(Message, message_id)
+        if not msg:
+            return False
+        msg.content = new_content.strip()
+        await session.commit()
+        return True
+
+
 async def archive_message(message_id: int) -> bool:
     async with async_session() as session:
         msg = await session.get(Message, message_id)
@@ -538,67 +604,132 @@ def _period_filter(column, period: Optional[tuple[dt.datetime, dt.datetime]]):
     return column.between(start, end)
 
 
-async def get_stats(period: Optional[tuple[dt.datetime, dt.datetime]] = None) -> dict:
-    async with async_session() as session:
-        cond = _period_filter(Lead.message_sent_at, period)
+async def _distinct_lead_ids_with_event(session, event_type: str, message_id: Optional[int] = None,
+                                         period_leads: Optional[list[int]] = None) -> set[int]:
+    q = select(LeadEvent.lead_id).where(LeadEvent.event_type == event_type).distinct()
+    if message_id is not None:
+        q = q.where(LeadEvent.message_id == message_id)
+    result = await session.scalars(q)
+    ids = set(result.all())
+    if period_leads is not None:
+        ids &= set(period_leads)
+    return ids
 
+
+async def _ever_reached_status(session, status: str, lead_ids: Optional[set[int]] = None) -> set[int]:
+    """Множество lead_id, у которых хотя бы раз был status_changed с этим статусом.
+    Для STATUS_CLIENT дополнительно учитывает client_closed-события — «Клиент закрыт» можно
+    поставить и напрямую, минуя промежуточный шаг «🤝 Клиент»."""
+    if status == STATUS_CLIENT_CLOSED:
+        result = await session.scalars(
+            select(LeadEvent.lead_id).where(LeadEvent.event_type == "client_closed").distinct()
+        )
+        ids = set(result.all())
+        if lead_ids is not None:
+            ids &= lead_ids
+        return ids
+
+    q = select(LeadEvent.lead_id).where(
+        LeadEvent.event_type == "status_changed", LeadEvent.details == status
+    ).distinct()
+    result = await session.scalars(q)
+    ids = set(result.all())
+    if status == STATUS_CLIENT:
+        closed = await session.scalars(
+            select(LeadEvent.lead_id).where(LeadEvent.event_type == "client_closed").distinct()
+        )
+        ids |= set(closed.all())
+    if lead_ids is not None:
+        ids &= lead_ids
+    return ids
+
+
+async def get_stats(period: Optional[tuple[dt.datetime, dt.datetime]] = None) -> dict:
+    """Историческая статистика: Отправлено/Ответили/Интерес/Клиенты/Клиент закрыт считаются
+    по lead_events (кто хоть раз дошёл до этапа), а не по текущему статусу — переход дальше
+    по воронке не уменьшает показатели предыдущих этапов."""
+    async with async_session() as session:
         total = await session.scalar(select(func.count(Lead.id))) or 0
 
-        # "реально отправлено" — по факту наличия message_sent_at, а не по сумме отдельных
-        # статусов (так в подсчёт честно попадают и 🚫 Бан, и 🗑 Удалено — им тоже отправляли)
-        sent_q = select(func.count(Lead.id)).where(Lead.message_sent_at.is_not(None))
+        cond = _period_filter(Lead.message_sent_at, period)
+        period_lead_ids: Optional[list[int]] = None
         if cond is not None:
-            sent_q = sent_q.where(cond)
-        sent_total = await session.scalar(sent_q) or 0
+            result = await session.scalars(select(Lead.id).where(cond))
+            period_lead_ids = list(result.all())
 
-        by_status = {}
+        sent_ids = await _distinct_lead_ids_with_event(session, "message_sent")
+        sent_ids |= await _ever_reached_status(session, STATUS_SENT)
+        if period_lead_ids is not None:
+            sent_ids &= set(period_lead_ids)
+        sent_total = len(sent_ids)
+
+        by_status: dict[str, int] = {}
+        for status in HISTORICAL_FUNNEL_STATUSES:
+            ids = await _ever_reached_status(session, status, set(period_lead_ids) if period_lead_ids is not None else None)
+            by_status[status] = len(ids)
+
+        # остальные статусы — обычный текущий срез (это не funnel-этапы, а "парковочные" состояния)
         for status in ALL_STATUSES:
+            if status in HISTORICAL_FUNNEL_STATUSES:
+                continue
             q = select(func.count(Lead.id)).where(Lead.status == status)
             if cond is not None:
                 q = q.where(cond)
             by_status[status] = await session.scalar(q) or 0
+
     return {"total": total, "sent_total": sent_total, "by_status": by_status}
 
 
+MESSAGE_STATS_STATUSES = (STATUS_REPLIED, STATUS_INTEREST, STATUS_CLIENT, STATUS_CLIENT_CLOSED, STATUS_REJECT, STATUS_ARCHIVE)
+
+
 async def get_message_stats(message_id: int) -> dict:
+    """Исторически честная статистика по конкретному сообщению (по lead_events, категория-специфична)."""
     async with async_session() as session:
         msg = await session.get(Message, message_id)
         if not msg:
-            return {"total": 0, "by_status": {s: 0 for s in (STATUS_REPLIED, STATUS_INTEREST, STATUS_CLIENT, STATUS_REJECT, STATUS_ARCHIVE)}}
+            return {"total": 0, "by_status": {s: 0 for s in MESSAGE_STATS_STATUSES}}
 
-        column = {
-            "initial": Lead.message_id,
-            "fu1": Lead.fu1_message_id,
-            "fu2": Lead.fu2_message_id,
-        }[msg.category]
+        send_event = SEND_EVENT_BY_CATEGORY[msg.category]
+        sent_ids = await _distinct_lead_ids_with_event(session, send_event, message_id)
+        total = len(sent_ids)
 
-        total = await session.scalar(
-            select(func.count(Lead.id)).where(column == message_id)
-        ) or 0
         by_status = {}
-        for status in (STATUS_REPLIED, STATUS_INTEREST, STATUS_CLIENT, STATUS_REJECT, STATUS_ARCHIVE):
-            by_status[status] = await session.scalar(
-                select(func.count(Lead.id)).where(column == message_id, Lead.status == status)
-            ) or 0
+        for status in MESSAGE_STATS_STATUSES:
+            if status in HISTORICAL_FUNNEL_STATUSES:
+                ids = await _ever_reached_status(session, status, sent_ids)
+                by_status[status] = len(ids)
+            elif not sent_ids:
+                by_status[status] = 0
+            else:
+                # Отказ/Архив — текущий срез среди тех, кому отправляли именно это сообщение
+                by_status[status] = await session.scalar(
+                    select(func.count(Lead.id)).where(Lead.id.in_(list(sent_ids)), Lead.status == status)
+                ) or 0
     return {"total": total, "by_status": by_status}
 
 
 async def best_initial_message(period: Optional[tuple[dt.datetime, dt.datetime]] = None) -> Optional[tuple[Message, int, int]]:
-    """Сообщение категории initial с лучшей конверсией в клиента. Возвращает (message, sent, clients) или None."""
+    """Сообщение категории initial с лучшей исторической конверсией в клиента (клиент+закрыт). Возвращает (message, sent, clients) или None."""
     messages = await get_messages("initial")
     best = None
     async with async_session() as session:
+        cond = _period_filter(Lead.message_sent_at, period)
+        period_lead_ids: Optional[set[int]] = None
+        if cond is not None:
+            result = await session.scalars(select(Lead.id).where(cond))
+            period_lead_ids = set(result.all())
+
         for msg in messages:
-            sent_q = select(func.count(Lead.id)).where(Lead.message_id == msg.id, Lead.status.in_(ENGAGED_STATUSES + (STATUS_REJECT, STATUS_ARCHIVE)))
-            clients_q = select(func.count(Lead.id)).where(Lead.message_id == msg.id, Lead.status == STATUS_CLIENT)
-            cond = _period_filter(Lead.message_sent_at, period)
-            if cond is not None:
-                sent_q = sent_q.where(cond)
-                clients_q = clients_q.where(cond)
-            sent = await session.scalar(sent_q) or 0
-            clients = await session.scalar(clients_q) or 0
+            sent_ids = await _distinct_lead_ids_with_event(session, "message_sent", msg.id)
+            if period_lead_ids is not None:
+                sent_ids &= period_lead_ids
+            sent = len(sent_ids)
             if sent == 0:
                 continue
+            client_ids = await _ever_reached_status(session, STATUS_CLIENT, sent_ids)
+            closed_ids = await _ever_reached_status(session, STATUS_CLIENT_CLOSED, sent_ids)
+            clients = len(client_ids | closed_ids)
             ratio = clients / sent
             if best is None or ratio > best[3]:
                 best = (msg, sent, clients, ratio)

@@ -16,9 +16,9 @@ from utils import short
 def main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="👤 Лиды"), KeyboardButton(text="💬 Сообщения")],
-            [KeyboardButton(text="📅 Follow-up"), KeyboardButton(text="📊 Статистика")],
-            [KeyboardButton(text="💾 Бэкап"), KeyboardButton(text="⚙️ Другое")],
+            [KeyboardButton(text="👤 Лиды"), KeyboardButton(text="📈 Статистика")],
+            [KeyboardButton(text="📅 Follow-up"), KeyboardButton(text="💾 Бэкап")],
+            [KeyboardButton(text="⚙️ Другое")],
         ],
         resize_keyboard=True,
     )
@@ -37,7 +37,10 @@ def leads_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="➕ Добавить лидов", callback_data="leads:add")],
         [InlineKeyboardButton(text="📋 Новые лиды", callback_data="leads:new")],
         [InlineKeyboardButton(text="🔎 Найти лида", callback_data="leads:find")],
-        [InlineKeyboardButton(text="📄 Вся база", callback_data="leads:all")],
+        [
+            InlineKeyboardButton(text="📄 Вся база", callback_data="leads:all"),
+            InlineKeyboardButton(text="🔥 Тёплые", callback_data="leads:warm"),
+        ],
     ])
 
 
@@ -81,6 +84,7 @@ def status_kb(lead: db.Lead) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="💬 Ответил", callback_data=f"st:{username}:replied")],
         [InlineKeyboardButton(text="🔥 Интерес", callback_data=f"st:{username}:interest")],
         [InlineKeyboardButton(text="🤝 Клиент", callback_data=f"st:{username}:client")],
+        [InlineKeyboardButton(text="💰 Клиент закрыт", callback_data=f"closeclient:{username}")],
         [InlineKeyboardButton(text="❌ Отказ", callback_data=f"st:{username}:reject")],
         [InlineKeyboardButton(text="🚫 Бан", callback_data=f"st:{username}:ban")],
         [InlineKeyboardButton(text="🗑 Удалено", callback_data=f"st:{username}:deleted")],
@@ -108,8 +112,12 @@ def bulk_status_kb() -> InlineKeyboardMarkup:
     ])
 
 
-def build_pagination_kb(page: int, total_pages: int, window: int = 1) -> Optional[InlineKeyboardMarkup]:
-    """Компактная пагинация: ⏪ 1 2 … 10 ⏩ (макс. 5 цифровых кнопок)."""
+def build_pagination_kb(
+    page: int, total_pages: int, window: int = 1,
+    prefix: str = "leads_page", back_target: str = "leads:menu",
+) -> Optional[InlineKeyboardMarkup]:
+    """Компактная пагинация: ⏪ 1 2 … 10 ⏩ (макс. 5 цифровых кнопок). Логика/раскладка не менялись —
+    только callback-префикс вынесен параметром, чтобы переиспользовать для «Тёплых»."""
     if total_pages <= 1:
         return None
     keep = {1, total_pages}
@@ -120,7 +128,7 @@ def build_pagination_kb(page: int, total_pages: int, window: int = 1) -> Optiona
 
     buttons: list[InlineKeyboardButton] = []
     if page > 1:
-        buttons.append(InlineKeyboardButton(text="⏪", callback_data=f"leads_page:{page - 1}"))
+        buttons.append(InlineKeyboardButton(text="⏪", callback_data=f"{prefix}:{page - 1}"))
     prev_shown = None
     for p in ordered:
         if prev_shown is not None and p - prev_shown > 1:
@@ -128,11 +136,11 @@ def build_pagination_kb(page: int, total_pages: int, window: int = 1) -> Optiona
         if p == page:
             buttons.append(InlineKeyboardButton(text=f"·{p}·", callback_data="noop"))
         else:
-            buttons.append(InlineKeyboardButton(text=str(p), callback_data=f"leads_page:{p}"))
+            buttons.append(InlineKeyboardButton(text=str(p), callback_data=f"{prefix}:{p}"))
         prev_shown = p
     if page < total_pages:
-        buttons.append(InlineKeyboardButton(text="⏩", callback_data=f"leads_page:{page + 1}"))
-    return InlineKeyboardMarkup(inline_keyboard=[buttons, back_row("leads:menu")])
+        buttons.append(InlineKeyboardButton(text="⏩", callback_data=f"{prefix}:{page + 1}"))
+    return InlineKeyboardMarkup(inline_keyboard=[buttons, back_row(back_target)])
 
 
 def confirm_kb(action: str, yes_text: str = "✅ Да", no_text: str = "❌ Отмена") -> InlineKeyboardMarkup:
@@ -159,7 +167,7 @@ def delete_confirm_kb(username: str) -> InlineKeyboardMarkup:
 
 def choose_message_kb(recents: list[db.Message]) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(text=f"{i + 1}. {short(m.content, 30)}", callback_data=f"pickmsg:{i}")]
+        [InlineKeyboardButton(text=f"{m.title}  {short(m.content, 20)}", callback_data=f"pickmsg:{i}")]
         for i, m in enumerate(recents)
     ]
     rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_choose")])
@@ -170,33 +178,25 @@ def choose_message_kb(recents: list[db.Message]) -> InlineKeyboardMarkup:
 # Раздел «Сообщения»
 # ---------------------------------------------------------------------------
 
-def messages_categories_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✉️ Первое сообщение", callback_data="msgcat:initial"),
-            InlineKeyboardButton(text="🔁 FU1", callback_data="msgcat:fu1"),
-            InlineKeyboardButton(text="🔁 FU2", callback_data="msgcat:fu2"),
-        ],
-    ])
-
-
 def messages_list_kb(messages: list[db.Message], category: str) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(text=f"{m.title}  {short(m.content, 28)}", callback_data=f"msgcard:{m.id}")]
+        [InlineKeyboardButton(text=f"{m.title}  {short(m.content, 20)}", callback_data=f"msgcard:{m.id}")]
         for m in messages
     ]
-    rows.append(back_row("messages:menu"))
+    rows.append(back_row("stats:bymessage"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def message_card_kb(message: db.Message, category: str) -> InlineKeyboardMarkup:
+    """Без «Статистика» — полная статистика теперь показывается прямо в карточке (см. messages.py)."""
     rows = [
-        [InlineKeyboardButton(text="✅ Использовать", callback_data=f"msguse:{message.id}")],
-        [InlineKeyboardButton(text="📊 Статистика", callback_data=f"msgstats:{message.id}")],
+        [InlineKeyboardButton(text="📤 Использовать", callback_data=f"msguse:{message.id}")],
+        [InlineKeyboardButton(text="📄 Полный текст", callback_data=f"msgfulltext:{message.id}")],
+        [InlineKeyboardButton(text="✏️ Изменить текст", callback_data=f"msgedit:{message.id}")],
     ]
     if message.active:
         rows.append([InlineKeyboardButton(text="📦 Архивировать", callback_data=f"msgarchive:{message.id}")])
-    rows.append(back_row(f"msgcat:{category}"))
+    rows.append(back_row(f"statsmsgcat:{category}"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -213,9 +213,9 @@ def followup_summary_kb() -> InlineKeyboardMarkup:
 def followup_detail_kb(has_fu1: bool, has_fu2: bool) -> InlineKeyboardMarkup:
     rows = []
     if has_fu1:
-        rows.append([InlineKeyboardButton(text="✉️ Отправить FU1", callback_data="followup:send:fu1")])
+        rows.append([InlineKeyboardButton(text="📨 Отправить FU1", callback_data="followup:send:fu1")])
     if has_fu2:
-        rows.append([InlineKeyboardButton(text="✉️ Отправить FU2", callback_data="followup:send:fu2")])
+        rows.append([InlineKeyboardButton(text="📨 Отправить FU2", callback_data="followup:send:fu2")])
     rows.append([InlineKeyboardButton(text="📄 Посмотреть список", callback_data="followup:list")])
     rows.append(back_row("nav:main"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -241,9 +241,9 @@ def stats_period_kb() -> InlineKeyboardMarkup:
 def stats_by_message_categories_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="✉️ Первое", callback_data="statsmsgcat:initial"),
-            InlineKeyboardButton(text="🔁 FU1", callback_data="statsmsgcat:fu1"),
-            InlineKeyboardButton(text="🔁 FU2", callback_data="statsmsgcat:fu2"),
+            InlineKeyboardButton(text="📨 Первые", callback_data="statsmsgcat:initial"),
+            InlineKeyboardButton(text="↩️ FU1", callback_data="statsmsgcat:fu1"),
+            InlineKeyboardButton(text="↪️ FU2", callback_data="statsmsgcat:fu2"),
         ],
         back_row("stats:menu"),
     ])
@@ -257,7 +257,10 @@ def backup_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="💾 Создать бэкап", callback_data="backup:create"),
-            InlineKeyboardButton(text="🕘 История", callback_data="backup:history"),
+        ],
+        [
+            InlineKeyboardButton(text="♻️ Восстановить", callback_data="backup:restore"),
+            InlineKeyboardButton(text="📋 Последние бэкапы", callback_data="backup:history"),
         ],
     ])
 
