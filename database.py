@@ -162,6 +162,7 @@ async def init_db() -> None:
         await conn.run_sync(Base.metadata.create_all)
     import migrations
     await migrations.migrate_old_schema()
+    await backfill_missing_status_events()
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +382,69 @@ def _response_stage_for(lead: Lead) -> str:
     return "initial"
 
 
+async def backfill_missing_status_events() -> int:
+    """Одноразовая (идемпотентная) докрутка истории: если у лида текущий статус — один из
+    воронки (Ответил/Интерес/Клиент/Клиент закрыт), но подходящего события в lead_events нет
+    (лид старше, чем появилось логирование) — подставляем одно событие с датой создания лида.
+    Ничего не выдумываем сверх текущего статуса — промежуточные этапы не достраиваем."""
+    filled = 0
+    async with async_session() as session:
+        # «Отправлено»: у лида есть message_sent_at, но ни одного события отправки нет
+        result = await session.scalars(select(Lead).where(Lead.message_sent_at.is_not(None)))
+        for lead in result.all():
+            exists = await session.scalar(
+                select(LeadEvent.id).where(
+                    LeadEvent.lead_id == lead.id,
+                    LeadEvent.event_type.in_(("message_sent",)),
+                )
+            )
+            has_sent_status_event = await session.scalar(
+                select(LeadEvent.id).where(
+                    LeadEvent.lead_id == lead.id,
+                    LeadEvent.event_type == "status_changed", LeadEvent.details == STATUS_SENT,
+                )
+            )
+            if not exists and not has_sent_status_event:
+                session.add(LeadEvent(
+                    lead_id=lead.id, event_type="message_sent",
+                    message_id=lead.message_id, timestamp=lead.message_sent_at,
+                ))
+                filled += 1
+
+        for status in HISTORICAL_FUNNEL_STATUSES:
+            result = await session.scalars(select(Lead).where(Lead.status == status))
+            for lead in result.all():
+                if status == STATUS_CLIENT_CLOSED:
+                    exists = await session.scalar(
+                        select(LeadEvent.id).where(
+                            LeadEvent.lead_id == lead.id, LeadEvent.event_type == "client_closed"
+                        )
+                    )
+                    if not exists:
+                        session.add(LeadEvent(
+                            lead_id=lead.id, event_type="client_closed",
+                            message_id=lead.message_id, timestamp=lead.created_at,
+                        ))
+                        filled += 1
+                else:
+                    exists = await session.scalar(
+                        select(LeadEvent.id).where(
+                            LeadEvent.lead_id == lead.id,
+                            LeadEvent.event_type == "status_changed",
+                            LeadEvent.details == status,
+                        )
+                    )
+                    if not exists:
+                        session.add(LeadEvent(
+                            lead_id=lead.id, event_type="status_changed",
+                            details=status, timestamp=lead.created_at,
+                        ))
+                        filled += 1
+        if filled:
+            await session.commit()
+    return filled
+
+
 async def close_client(username: str, amount: float) -> bool:
     """Переводит лида в 💰 Клиент закрыт и фиксирует сумму сделки отдельным событием."""
     async with async_session() as session:
@@ -570,6 +634,17 @@ async def get_message_by_tag(tag: str) -> Optional[Message]:
     tag = tag.strip().lstrip("#")
     async with async_session() as session:
         return await session.scalar(select(Message).where(Message.title == f"#{tag}"))
+
+
+async def rename_message_tag(message_id: int, new_tag: str) -> bool:
+    """Меняет ТОЛЬКО тег (title), например у старых сообщений формата N1 -> #fst_1. Статистика не трогается."""
+    async with async_session() as session:
+        msg = await session.get(Message, message_id)
+        if not msg:
+            return False
+        msg.title = new_tag
+        await session.commit()
+        return True
 
 
 async def change_message_content(message_id: int, new_content: str) -> bool:

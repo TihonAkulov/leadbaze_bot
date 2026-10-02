@@ -233,7 +233,10 @@ def stats_period_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="Месяц", callback_data="statsperiod:30"),
             InlineKeyboardButton(text="Всё время", callback_data="statsperiod:all"),
         ],
-        [InlineKeyboardButton(text="💬 По сообщениям", callback_data="stats:bymessage")],
+        [
+            InlineKeyboardButton(text="📅 По дням", callback_data="stats:daily"),
+            InlineKeyboardButton(text="💬 По сообщениям", callback_data="stats:bymessage"),
+        ],
         back_row("nav:main"),
     ])
 

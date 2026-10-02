@@ -73,6 +73,8 @@ class Form(StatesGroup):
     adding_improvement_note = State()
     change_msg_text_tag = State()
     change_msg_text_value = State()
+    change_msg_tag_pick = State()
+    change_msg_tag_value = State()
     close_client_amount = State()
     awaiting_restore_file = State()
 
@@ -347,7 +349,9 @@ async def cmd_help(event) -> None:
         "💾 <b>Бэкап</b> — .db + .xlsx, история, восстановление (можно прислать свой .db файлом)\n"
         "⚙️ <b>Другое</b> — заметки, помощь, очистка базы\n\n"
         "💰 Клиент закрыт — отдельная кнопка на карточке лида, спросит сумму сделки\n"
-        "/change_msg_text — изменить текст сообщения по тегу (fst_1, fu1_1...), не создавая новое\n\n"
+        "📈 Статистика → 📅 По дням — Сегодня/Вчера/Позавчера, окно 07:00–23:00 МСК\n"
+        "/change_msg_text — изменить текст сообщения по тегу, не создавая новое\n"
+        "/change_msg_tag — переименовать тег у старых сообщений (N1 → #fst_1 и т.п.)\n\n"
         "Быстрая смена статуса текстом: @username интерес / ответил / клиент / отказ / бан / удалено / архив\n"
         "/msg_leads, /fu_leads, /change_status, /change_date, /del@username — как раньше, текстовыми командами"
     )
@@ -868,6 +872,76 @@ async def change_msg_text_value_input(message: Message, state: FSMContext) -> No
         await message.answer("Сообщение не найдено.", reply_markup=kb.main_menu_kb())
 
 
+# --- /change_msg_tag: перевод старых тегов (N1, N2...) в новый формат (#fst_1 и т.д.) ---
+
+@router.message(Command("change_msg_tag"))
+async def cmd_change_msg_tag(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    ikb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📨 Первые", callback_data="tagcat:initial"),
+        InlineKeyboardButton(text="↩️ FU1", callback_data="tagcat:fu1"),
+        InlineKeyboardButton(text="↪️ FU2", callback_data="tagcat:fu2"),
+    ]])
+    await message.answer("Для какой категории менять теги?", reply_markup=ikb)
+
+
+@router.callback_query(F.data.startswith("tagcat:"))
+async def cb_change_msg_tag_category(callback: CallbackQuery, state: FSMContext) -> None:
+    category = callback.data.split(":", 1)[1]
+    messages_list = await db.get_messages(category, active_only=False)
+    if not messages_list:
+        await callback.answer("В этой категории пока нет сообщений.", show_alert=True)
+        return
+    lines = [f"Сообщения категории «{db.CATEGORY_LABELS.get(category, category)}»:", ""]
+    for i, m in enumerate(messages_list, start=1):
+        lines.append(f"{i}. {m.title}")
+    lines.append("")
+    lines.append("Введите номер сообщения, тег которого нужно поменять.")
+    await state.set_state(Form.change_msg_tag_pick)
+    await state.update_data(tag_message_ids=[m.id for m in messages_list])
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("\n".join(lines))
+    await callback.answer()
+
+
+@router.message(Form.change_msg_tag_pick)
+async def change_msg_tag_pick_input(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    ids = data.get("tag_message_ids") or []
+    text_value = (message.text or "").strip()
+    if not text_value.isdigit() or not (1 <= int(text_value) <= len(ids)):
+        await message.answer("Не понял номер. Пришли число из списка выше.")
+        return
+    message_id = ids[int(text_value) - 1]
+    await state.set_state(Form.change_msg_tag_value)
+    await state.update_data(tag_message_id=message_id)
+    await message.answer("Пришли новый тег (например: fst_1).")
+
+
+@router.message(Form.change_msg_tag_value)
+async def change_msg_tag_value_input(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    message_id = data.get("tag_message_id")
+    await state.clear()
+    raw = (message.text or "").strip().lstrip("#")
+    if not raw:
+        await message.answer("Пустой тег не подходит.", reply_markup=kb.main_menu_kb())
+        return
+    new_tag = f"#{raw}"
+    existing = await db.get_message_by_tag(raw)
+    if existing and existing.id != message_id:
+        await message.answer(
+            f"Тег {new_tag} уже занят сообщением {existing.title}. Пришли другой тег.",
+            reply_markup=kb.main_menu_kb(),
+        )
+        return
+    ok = await db.rename_message_tag(message_id, new_tag)
+    if ok:
+        await message.answer(f"✅ Тег изменён на {new_tag}.", reply_markup=kb.main_menu_kb())
+    else:
+        await message.answer("Сообщение не найдено.", reply_markup=kb.main_menu_kb())
+
+
 # --- 💰 Клиент закрыт: статус + сумма сделки ---
 
 @router.callback_query(F.data.startswith("closeclient:"))
@@ -1066,6 +1140,13 @@ async def cb_stats_menu(callback: CallbackQuery) -> None:
 async def cb_stats_period(callback: CallbackQuery) -> None:
     code = callback.data.split(":", 1)[1]
     text = await stats_mod.render_overall_stats(code)
+    await callback.message.edit_text(text, reply_markup=kb.stats_period_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "stats:daily")
+async def cb_stats_daily(callback: CallbackQuery) -> None:
+    text = await stats_mod.render_daily_breakdown()
     await callback.message.edit_text(text, reply_markup=kb.stats_period_kb())
     await callback.answer()
 

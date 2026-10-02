@@ -60,6 +60,30 @@ def client_conversion_pct(s: dict) -> str:
     return conversion_pct(s["by_status"][db.STATUS_CLIENT], s["sent_total"])
 
 
+def day_window(days_back: int) -> tuple[dt.datetime, dt.datetime]:
+    """Окно 07:00–23:00 по Москве для дня `days_back` назад (0 — сегодня)."""
+    day = (moscow_now() - dt.timedelta(days=days_back)).date()
+    start = dt.datetime.combine(day, dt.time(7, 0))
+    end = dt.datetime.combine(day, dt.time(23, 0))
+    return start, end
+
+
+async def render_daily_breakdown() -> str:
+    labels = ["Сегодня", "Вчера", "Позавчера"]
+    lines = ["📅 <b>СТАТИСТИКА ПО ДНЯМ</b>", "(окно 07:00–23:00 по Москве, по дате отправки)"]
+    for i, label in enumerate(labels):
+        start, end = day_window(i)
+        s = await db.get_stats((start, end))
+        lines.append("")
+        lines.append(f"<b>{label}</b> ({start.strftime('%d.%m')})")
+        lines.append(f"✉️ Отправлено: {s['sent_total']}")
+        lines.append(f"💬 Ответили: {s['by_status'][db.STATUS_REPLIED]}")
+        lines.append(f"🔥 Интерес: {s['by_status'][db.STATUS_INTEREST]}")
+        lines.append(f"🤝 Клиенты: {s['by_status'][db.STATUS_CLIENT]}")
+        lines.append(f"💰 Клиент закрыт: {s['by_status'][db.STATUS_CLIENT_CLOSED]}")
+    return "\n".join(lines)
+
+
 async def render_leads_summary() -> str:
     """Краткая сводка по статусам для раздела «Лиды» (без периода — общий срез сейчас)."""
     s = await db.get_stats(period=None)
