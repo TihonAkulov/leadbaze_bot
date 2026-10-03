@@ -743,9 +743,13 @@ async def get_stats(period: Optional[tuple[dt.datetime, dt.datetime]] = None) ->
             ids = await _ever_reached_status(session, status, set(period_lead_ids) if period_lead_ids is not None else None)
             by_status[status] = len(ids)
 
+        # 🟡 Отправлено — та же историческая цифра, что и sent_total (единое число везде,
+        # а не "сколько сейчас стоит на этом статусе", которое падает по мере ответов)
+        by_status[STATUS_SENT] = sent_total
+
         # остальные статусы — обычный текущий срез (это не funnel-этапы, а "парковочные" состояния)
         for status in ALL_STATUSES:
-            if status in HISTORICAL_FUNNEL_STATUSES:
+            if status in HISTORICAL_FUNNEL_STATUSES or status == STATUS_SENT:
                 continue
             q = select(func.count(Lead.id)).where(Lead.status == status)
             if cond is not None:

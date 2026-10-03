@@ -26,7 +26,10 @@ from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, ReplyKeyboardRemove
+from aiogram.types import (
+    CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup,
+    Message, ReplyKeyboardRemove,
+)
 from dotenv import load_dotenv
 
 import backup as backup_mod
@@ -275,7 +278,13 @@ async def apply_chosen_message(target: Message, state: FSMContext, content: str)
         await target.answer(f"✅ Сообщение присвоено {count} лидам: {message_obj.title}", reply_markup=kb.main_menu_kb())
         return
 
+    # неизвестный/утерянный purpose — не молчим, сбрасываем состояние и сообщаем явно
     await state.clear()
+    await target.answer(
+        "Не понял, что делать с этим текстом (похоже, предыдущий сценарий прервался). "
+        "Открой нужный раздел заново.",
+        reply_markup=kb.main_menu_kb(),
+    )
 
 
 async def finalize_followup(target: Message, state: FSMContext) -> None:
@@ -741,7 +750,6 @@ async def change_date_value_input(message: Message, state: FSMContext) -> None:
 @router.message(Command("fu_leads"))
 async def cmd_fu_leads(message: Message, state: FSMContext) -> None:
     await state.clear()
-    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
     ikb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="FU1", callback_data="fufor:fu1"),
         InlineKeyboardButton(text="FU2", callback_data="fufor:fu2"),
@@ -876,13 +884,17 @@ async def change_msg_text_value_input(message: Message, state: FSMContext) -> No
 
 @router.message(Command("change_msg_tag"))
 async def cmd_change_msg_tag(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    ikb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="📨 Первые", callback_data="tagcat:initial"),
-        InlineKeyboardButton(text="↩️ FU1", callback_data="tagcat:fu1"),
-        InlineKeyboardButton(text="↪️ FU2", callback_data="tagcat:fu2"),
-    ]])
-    await message.answer("Для какой категории менять теги?", reply_markup=ikb)
+    try:
+        await state.clear()
+        ikb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="📨 Первые", callback_data="tagcat:initial"),
+            InlineKeyboardButton(text="↩️ FU1", callback_data="tagcat:fu1"),
+            InlineKeyboardButton(text="↪️ FU2", callback_data="tagcat:fu2"),
+        ]])
+        await message.answer("Для какой категории менять теги?", reply_markup=ikb)
+    except Exception as e:
+        logger.exception("Ошибка в /change_msg_tag")
+        await message.answer(f"⚠️ Ошибка: {e}")
 
 
 @router.callback_query(F.data.startswith("tagcat:"))
@@ -1193,7 +1205,6 @@ async def cb_backup_create(callback: CallbackQuery) -> None:
     await callback.answer("Создаю бэкап...")
     db_path, xlsx_path, count = await backup_mod.create_backup(kind="manual")
     await callback.message.answer(f"✅ Бэкап создан\nЛидов: {count}\nДата: {fmt_datetime(moscow_now())}")
-    from aiogram.types import FSInputFile
     await callback.message.answer_document(FSInputFile(db_path))
     await callback.message.answer_document(FSInputFile(xlsx_path))
 
