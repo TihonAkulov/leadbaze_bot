@@ -34,11 +34,12 @@ from dotenv import load_dotenv
 
 import backup as backup_mod
 import database as db
+import evening
 import keyboards as kb
 import stats as stats_mod
 from messages import render_category_list, render_message_card
 from utils import (
-    extract_usernames, fmt_date, fmt_datetime, moscow_now,
+    ADMIN_NAME, extract_usernames, fmt_date, fmt_datetime, moscow_now,
     parse_date_input, parse_position_selector, seconds_until, short,
 )
 
@@ -480,11 +481,12 @@ async def search_result(message: Message, state: FSMContext) -> None:
     if not usernames:
         await message.answer("Не нашёл username в сообщении.", reply_markup=kb.main_menu_kb())
         return
-    lead = await db.find_lead(usernames[0])
-    if not lead:
-        await message.answer(f"⚠️ @{usernames[0]} не найден в базе.", reply_markup=kb.main_menu_kb())
-        return
-    await message.answer(await lead_card_text(lead), reply_markup=kb.status_kb(lead))
+    for username in usernames:
+        lead = await db.find_lead(username)
+        if not lead:
+            await message.answer(f"❓ @{username} — не найден в базе.")
+        else:
+            await message.answer(await lead_card_text(lead), reply_markup=kb.status_kb(lead))
 
 
 # ---------------------------------------------------------------------------
@@ -1486,10 +1488,24 @@ async def daily_followup_task(bot: Bot) -> None:
             pending_fu1_batch = [l.username for l in fu1_leads]
             pending_fu2_batch = [l.username for l in fu2_leads]
             if fu1_leads or fu2_leads:
-                text = f"📅 <b>Follow-up на сегодня</b>\n🔁 FU1 — {len(fu1_leads)}\n🔁 FU2 — {len(fu2_leads)}"
+                text = (
+                    f"Доброе утро, {ADMIN_NAME}! ☀️\n\n"
+                    f"📅 <b>Follow-up на сегодня</b>\n🔁 FU1 — {len(fu1_leads)}\n🔁 FU2 — {len(fu2_leads)}"
+                )
                 await bot.send_message(ADMIN_ID, text, reply_markup=kb.followup_summary_kb())
         except Exception:
             logger.exception("Ошибка ежедневного Follow-up")
+
+
+async def daily_evening_report_task(bot: Bot) -> None:
+    """Вся логика — в evening.py. Здесь только планировщик (тот же паттерн, что и у остальных
+    фоновых задач выше)."""
+    while True:
+        await asyncio.sleep(seconds_until(23, 0))
+        try:
+            await evening.run_evening_report(bot, ADMIN_ID)
+        except Exception:
+            logger.exception("Ошибка вечернего отчёта")
 
 
 # ---------------------------------------------------------------------------
@@ -1527,6 +1543,7 @@ async def main() -> None:
     asyncio.create_task(periodic_auto_archive())
     asyncio.create_task(daily_backup_task())
     asyncio.create_task(daily_followup_task(bot))
+    asyncio.create_task(daily_evening_report_task(bot))
 
     logger.info("Бот запущен (V2)")
     await dp.start_polling(bot)

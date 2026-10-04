@@ -91,3 +91,4 @@ async def render_leads_summary() -> str:
     for status in db.ALL_STATUSES:
         lines.append(f"{status}: {s['by_status'][status]}")
     return "\n".join(lines)
+

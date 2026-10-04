@@ -15,6 +15,7 @@ load_dotenv()
 
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 BACKUP_DIR = os.getenv("BACKUP_DIR", "backups")
+ADMIN_NAME = os.getenv("ADMIN_NAME", "Тихон Вячеславович")
 
 esc = html.escape  # экранирование пользовательского текста для HTML-режима Telegram
 

@@ -153,6 +153,23 @@ class User(Base):
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class DailyReport(Base):
+    """Снэпшот вечернего отчёта за день: база для личных рекордов и защита от повторной
+    отправки (уникальность по дате — вторая попытка в тот же день просто ничего не найдёт для сравнения и будет распознана как дубль на уровне бота)."""
+    __tablename__ = "daily_reports"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    report_date: Mapped[str] = mapped_column(String, unique=True)  # YYYY-MM-DD по МСК
+    sent: Mapped[int] = mapped_column(Integer, default=0)
+    replies: Mapped[int] = mapped_column(Integer, default=0)
+    warm: Mapped[int] = mapped_column(Integer, default=0)
+    clients: Mapped[int] = mapped_column(Integer, default=0)
+    closed: Mapped[int] = mapped_column(Integer, default=0)
+    revenue: Mapped[float] = mapped_column(Float, default=0.0)
+    score: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+
+
 # ---------------------------------------------------------------------------
 # Инициализация и миграция схемы
 # ---------------------------------------------------------------------------
@@ -239,6 +256,71 @@ async def get_leads_by_positions(positions: list[int]) -> list[Lead]:
         if lead:
             leads.append(lead)
     return leads
+
+
+async def get_revenue(period: tuple[dt.datetime, dt.datetime]) -> float:
+    """Сумма закрытых сделок (client_closed) по времени самого события — за период."""
+    start, end = period
+    async with async_session() as session:
+        total = await session.scalar(
+            select(func.sum(LeadEvent.amount)).where(
+                LeadEvent.event_type == "client_closed",
+                LeadEvent.timestamp.between(start, end),
+            )
+        )
+        return float(total or 0.0)
+
+
+async def count_warm_in_period(period: tuple[dt.datetime, dt.datetime]) -> int:
+    """Сколько лидов, отправленных в этот период, СЕЙЧАС в тёплом статусе — то же
+    определение «тёплых», что и в кнопке 🔥 Тёплые (WARM_STATUSES), просто плюс фильтр по дате отправки."""
+    start, end = period
+    async with async_session() as session:
+        return await session.scalar(
+            select(func.count(Lead.id)).where(
+                Lead.message_sent_at.between(start, end), Lead.status.in_(WARM_STATUSES)
+            )
+        ) or 0
+
+
+async def get_previous_daily_maxes() -> Optional[dict]:
+    """MAX по каждому показателю среди уже сохранённых дневных отчётов (для личных рекордов).
+    None, если отчётов ещё не было — тогда сравнивать не с чем, рекорд не засчитывается."""
+    async with async_session() as session:
+        row = await session.execute(select(
+            func.max(DailyReport.sent), func.max(DailyReport.replies), func.max(DailyReport.warm),
+            func.max(DailyReport.clients), func.max(DailyReport.closed), func.max(DailyReport.revenue),
+            func.count(DailyReport.id),
+        ))
+        sent, replies, warm, clients, closed, revenue, count = row.one()
+    if not count:
+        return None
+    return {
+        "sent": sent or 0, "replies": replies or 0, "warm": warm or 0,
+        "clients": clients or 0, "closed": closed or 0, "revenue": revenue or 0.0,
+    }
+
+
+async def daily_report_exists(report_date: str) -> bool:
+    async with async_session() as session:
+        return bool(await session.scalar(
+            select(DailyReport.id).where(DailyReport.report_date == report_date)
+        ))
+
+
+async def save_daily_report(report_date: str, sent: int, replies: int, warm: int,
+                             clients: int, closed: int, revenue: float, score: int) -> bool:
+    """False, если отчёт за эту дату уже есть (уникальность по дате — защита от дублей)."""
+    async with async_session() as session:
+        existing = await session.scalar(select(DailyReport.id).where(DailyReport.report_date == report_date))
+        if existing:
+            return False
+        session.add(DailyReport(
+            report_date=report_date, sent=sent, replies=replies, warm=warm,
+            clients=clients, closed=closed, revenue=revenue, score=score,
+        ))
+        await session.commit()
+        return True
 
 
 async def count_warm_leads() -> int:
