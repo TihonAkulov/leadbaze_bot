@@ -272,15 +272,13 @@ async def get_revenue(period: tuple[dt.datetime, dt.datetime]) -> float:
 
 
 async def count_warm_in_period(period: tuple[dt.datetime, dt.datetime]) -> int:
-    """Сколько лидов, отправленных в этот период, СЕЙЧАС в тёплом статусе — то же
-    определение «тёплых», что и в кнопке 🔥 Тёплые (WARM_STATUSES), просто плюс фильтр по дате отправки."""
-    start, end = period
+    """Сколько РАЗНЫХ лидов стали тёплыми (Ответил/Интерес/Клиент/Клиент закрыт) именно в этот
+    период — по дате самого события, а не по дате отправки им первого сообщения/FU."""
     async with async_session() as session:
-        return await session.scalar(
-            select(func.count(Lead.id)).where(
-                Lead.message_sent_at.between(start, end), Lead.status.in_(WARM_STATUSES)
-            )
-        ) or 0
+        ids: set[int] = set()
+        for status in (STATUS_REPLIED, STATUS_INTEREST, STATUS_CLIENT, STATUS_CLIENT_CLOSED):
+            ids |= await _ever_reached_status(session, status, period=period)
+        return len(ids)
 
 
 async def get_previous_daily_maxes() -> Optional[dict]:
@@ -761,82 +759,98 @@ def _period_filter(column, period: Optional[tuple[dt.datetime, dt.datetime]]):
     return column.between(start, end)
 
 
+def _event_period_filter(query, period: Optional[tuple[dt.datetime, dt.datetime]]):
+    """Фильтр по ВРЕМЕНИ САМОГО СОБЫТИЯ (LeadEvent.timestamp), а не по дате отправки лиду.
+    Это и есть исправление бага: событие учитывается в том дне, когда оно произошло."""
+    if period is None:
+        return query
+    start, end = period
+    return query.where(LeadEvent.timestamp.between(start, end))
+
+
 async def _distinct_lead_ids_with_event(session, event_type: str, message_id: Optional[int] = None,
-                                         period_leads: Optional[list[int]] = None) -> set[int]:
+                                         period: Optional[tuple[dt.datetime, dt.datetime]] = None) -> set[int]:
     q = select(LeadEvent.lead_id).where(LeadEvent.event_type == event_type).distinct()
     if message_id is not None:
         q = q.where(LeadEvent.message_id == message_id)
+    q = _event_period_filter(q, period)
     result = await session.scalars(q)
-    ids = set(result.all())
-    if period_leads is not None:
-        ids &= set(period_leads)
-    return ids
+    return set(result.all())
 
 
-async def _ever_reached_status(session, status: str, lead_ids: Optional[set[int]] = None) -> set[int]:
-    """Множество lead_id, у которых хотя бы раз был status_changed с этим статусом.
+async def _ever_reached_status(session, status: str, lead_ids: Optional[set[int]] = None,
+                                period: Optional[tuple[dt.datetime, dt.datetime]] = None) -> set[int]:
+    """Множество lead_id, у которых был status_changed с этим статусом — в периоде `period`
+    считается по ДАТЕ САМОГО ПЕРЕХОДА, а не по дате отправки первого сообщения/FU.
     Для STATUS_CLIENT дополнительно учитывает client_closed-события — «Клиент закрыт» можно
     поставить и напрямую, минуя промежуточный шаг «🤝 Клиент»."""
     if status == STATUS_CLIENT_CLOSED:
-        result = await session.scalars(
-            select(LeadEvent.lead_id).where(LeadEvent.event_type == "client_closed").distinct()
+        q = _event_period_filter(
+            select(LeadEvent.lead_id).where(LeadEvent.event_type == "client_closed").distinct(), period
         )
+        result = await session.scalars(q)
         ids = set(result.all())
         if lead_ids is not None:
             ids &= lead_ids
         return ids
 
-    q = select(LeadEvent.lead_id).where(
-        LeadEvent.event_type == "status_changed", LeadEvent.details == status
-    ).distinct()
+    q = _event_period_filter(
+        select(LeadEvent.lead_id).where(
+            LeadEvent.event_type == "status_changed", LeadEvent.details == status
+        ).distinct(),
+        period,
+    )
     result = await session.scalars(q)
     ids = set(result.all())
     if status == STATUS_CLIENT:
-        closed = await session.scalars(
-            select(LeadEvent.lead_id).where(LeadEvent.event_type == "client_closed").distinct()
+        q2 = _event_period_filter(
+            select(LeadEvent.lead_id).where(LeadEvent.event_type == "client_closed").distinct(), period
         )
+        closed = await session.scalars(q2)
         ids |= set(closed.all())
     if lead_ids is not None:
         ids &= lead_ids
     return ids
 
 
+EVENT_BASED_STATUSES = HISTORICAL_FUNNEL_STATUSES + (STATUS_REJECT, STATUS_BAN, STATUS_DELETED)
+
+
 async def get_stats(period: Optional[tuple[dt.datetime, dt.datetime]] = None) -> dict:
-    """Историческая статистика: Отправлено/Ответили/Интерес/Клиенты/Клиент закрыт считаются
-    по lead_events (кто хоть раз дошёл до этапа), а не по текущему статусу — переход дальше
-    по воронке не уменьшает показатели предыдущих этапов."""
+    """Историческая статистика: Отправлено/Ответили/Интерес/Клиенты/Клиент закрыт/Отказ/Бан/
+    Удалено считаются по lead_events — каждое по ДАТЕ СВОЕГО СОБЫТИЯ. Не по текущему статусу
+    (переход дальше по воронке не уменьшает показатели предыдущих этапов) и не по дате
+    отправки первого сообщения (FU через 5 дней после initial так же засчитывается в день,
+    когда он реально отправлен/получен ответ — а не теряется, если initial был в другом периоде)."""
     async with async_session() as session:
         total = await session.scalar(select(func.count(Lead.id))) or 0
 
-        cond = _period_filter(Lead.message_sent_at, period)
-        period_lead_ids: Optional[list[int]] = None
-        if cond is not None:
-            result = await session.scalars(select(Lead.id).where(cond))
-            period_lead_ids = list(result.all())
-
-        sent_ids = await _distinct_lead_ids_with_event(session, "message_sent")
-        sent_ids |= await _ever_reached_status(session, STATUS_SENT)
-        if period_lead_ids is not None:
-            sent_ids &= set(period_lead_ids)
+        sent_ids = await _distinct_lead_ids_with_event(session, "message_sent", period=period)
+        sent_ids |= await _distinct_lead_ids_with_event(session, "fu1_sent", period=period)
+        sent_ids |= await _distinct_lead_ids_with_event(session, "fu2_sent", period=period)
+        sent_ids |= await _ever_reached_status(session, STATUS_SENT, period=period)  # очень старые лиды без событий (см. backfill)
         sent_total = len(sent_ids)
 
         by_status: dict[str, int] = {}
         for status in HISTORICAL_FUNNEL_STATUSES:
-            ids = await _ever_reached_status(session, status, set(period_lead_ids) if period_lead_ids is not None else None)
+            ids = await _ever_reached_status(session, status, period=period)
             by_status[status] = len(ids)
 
-        # 🟡 Отправлено — та же историческая цифра, что и sent_total (единое число везде,
-        # а не "сколько сейчас стоит на этом статусе", которое падает по мере ответов)
+        # 🟡 Отправлено — та же цифра, что и sent_total (единое число везде)
         by_status[STATUS_SENT] = sent_total
 
-        # остальные статусы — обычный текущий срез (это не funnel-этапы, а "парковочные" состояния)
+        # Отказ/Бан/Удалено — тоже по дате события (симметрично с воронкой, баг был общий)
+        for status in (STATUS_REJECT, STATUS_BAN, STATUS_DELETED):
+            ids = await _ever_reached_status(session, status, period=period)
+            by_status[status] = len(ids)
+
+        # остальное — текущий срез (⚪ Не отправлено, 📦 Архив: не входят в воронку по датам)
         for status in ALL_STATUSES:
-            if status in HISTORICAL_FUNNEL_STATUSES or status == STATUS_SENT:
+            if status in EVENT_BASED_STATUSES or status == STATUS_SENT:
                 continue
-            q = select(func.count(Lead.id)).where(Lead.status == status)
-            if cond is not None:
-                q = q.where(cond)
-            by_status[status] = await session.scalar(q) or 0
+            by_status[status] = await session.scalar(
+                select(func.count(Lead.id)).where(Lead.status == status)
+            ) or 0
 
     return {"total": total, "sent_total": sent_total, "by_status": by_status}
 
