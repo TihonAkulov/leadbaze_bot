@@ -825,11 +825,15 @@ async def get_stats(period: Optional[tuple[dt.datetime, dt.datetime]] = None) ->
     async with async_session() as session:
         total = await session.scalar(select(func.count(Lead.id))) or 0
 
-        sent_ids = await _distinct_lead_ids_with_event(session, "message_sent", period=period)
-        sent_ids |= await _distinct_lead_ids_with_event(session, "fu1_sent", period=period)
-        sent_ids |= await _distinct_lead_ids_with_event(session, "fu2_sent", period=period)
-        sent_ids |= await _ever_reached_status(session, STATUS_SENT, period=period)  # очень старые лиды без событий (см. backfill)
-        sent_total = len(sent_ids)
+        initial_ids = await _distinct_lead_ids_with_event(session, "message_sent", period=period)
+        initial_ids |= await _ever_reached_status(session, STATUS_SENT, period=period)  # очень старые лиды без событий (см. backfill) — относим к «Первое»
+        fu1_ids = await _distinct_lead_ids_with_event(session, "fu1_sent", period=period)
+        fu2_ids = await _distinct_lead_ids_with_event(session, "fu2_sent", period=period)
+
+        sent_initial = len(initial_ids)
+        sent_fu1 = len(fu1_ids)
+        sent_fu2 = len(fu2_ids)
+        sent_total = sent_initial + sent_fu1 + sent_fu2  # явно сумма, как в ТЗ (не объединение лидов)
 
         by_status: dict[str, int] = {}
         for status in HISTORICAL_FUNNEL_STATUSES:
@@ -852,7 +856,11 @@ async def get_stats(period: Optional[tuple[dt.datetime, dt.datetime]] = None) ->
                 select(func.count(Lead.id)).where(Lead.status == status)
             ) or 0
 
-    return {"total": total, "sent_total": sent_total, "by_status": by_status}
+    return {
+        "total": total, "sent_total": sent_total,
+        "sent_initial": sent_initial, "sent_fu1": sent_fu1, "sent_fu2": sent_fu2,
+        "by_status": by_status,
+    }
 
 
 MESSAGE_STATS_STATUSES = (STATUS_REPLIED, STATUS_INTEREST, STATUS_CLIENT, STATUS_CLIENT_CLOSED, STATUS_REJECT, STATUS_ARCHIVE)

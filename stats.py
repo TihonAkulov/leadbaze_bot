@@ -12,6 +12,17 @@ from utils import moscow_now, short
 PERIOD_LABELS = {"1": "1 день", "7": "7 дней", "30": "Месяц", "all": "Всё время"}
 
 
+def sent_breakdown_lines(s: dict) -> list[str]:
+    """Единое место форматирования разбивки отправок — используется везде, где показывается
+    «Отправлено», чтобы не дублировать разметку по экранам."""
+    return [
+        f"📨 Отправлено: {s['sent_total']}",
+        f"├ Первое: {s['sent_initial']}",
+        f"├ FU1: {s['sent_fu1']}",
+        f"└ FU2: {s['sent_fu2']}",
+    ]
+
+
 def period_range(code: str) -> Optional[tuple[dt.datetime, dt.datetime]]:
     if code == "all":
         return None
@@ -27,7 +38,8 @@ async def render_overall_stats(period_code: str = "all") -> str:
         "📊 <b>СТАТИСТИКА</b>",
         f"Период: {PERIOD_LABELS.get(period_code, 'Всё время')}",
         "",
-        f"✉️ Отправлено: {s['sent_total']}",
+        *sent_breakdown_lines(s),
+        "",
         f"💬 Ответили: {s['by_status'][db.STATUS_REPLIED]}",
         f"🔥 Интерес: {s['by_status'][db.STATUS_INTEREST]}",
         f"🤝 Клиенты: {s['by_status'][db.STATUS_CLIENT]}",
@@ -76,7 +88,7 @@ async def render_daily_breakdown() -> str:
         s = await db.get_stats((start, end))
         lines.append("")
         lines.append(f"<b>{label}</b> ({start.strftime('%d.%m')})")
-        lines.append(f"✉️ Отправлено: {s['sent_total']}")
+        lines.extend(sent_breakdown_lines(s))
         lines.append(f"💬 Ответили: {s['by_status'][db.STATUS_REPLIED]}")
         lines.append(f"🔥 Интерес: {s['by_status'][db.STATUS_INTEREST]}")
         lines.append(f"🤝 Клиенты: {s['by_status'][db.STATUS_CLIENT]}")
