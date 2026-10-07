@@ -65,7 +65,9 @@ def conversion_pct(count: int, sent: int) -> str:
 
 
 def reply_conversion_pct(s: dict) -> str:
-    return conversion_pct(s["by_status"][db.STATUS_REPLIED], s["sent_total"])
+    """Конверсия в ответ считается ТОЛЬКО от первых сообщений (initial_sent) — FU1/FU2
+    на знаменатель не влияют, иначе конверсия занижается на пустом месте."""
+    return conversion_pct(s["by_status"][db.STATUS_REPLIED], s["sent_initial"])
 
 
 def client_conversion_pct(s: dict) -> str:
@@ -101,6 +103,9 @@ async def render_leads_summary() -> str:
     s = await db.get_stats(period=None)
     lines = [f"Всего: {s['total']}"]
     for status in db.ALL_STATUSES:
+        if status == db.STATUS_SENT:
+            lines.extend(sent_breakdown_lines(s))
+            continue
         lines.append(f"{status}: {s['by_status'][status]}")
     return "\n".join(lines)
 

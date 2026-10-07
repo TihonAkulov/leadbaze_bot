@@ -100,3 +100,33 @@ async def migrate_old_schema() -> None:
             f"Миграция V1->V2: перенесено сообщений — "
             f"первое: {migrated_initial}, FU1: {migrated_fu1}, FU2: {migrated_fu2}"
         )
+
+
+FLAG_LEAD_EVENTS_TZ = "lead_events_timestamp_utc_to_msk"
+
+
+async def fix_lead_events_timezone() -> None:
+    """Одноразово: lead_events.timestamp писался по умолчанию в UTC (dt.datetime.utcnow),
+    а «По дням»/вечерний отчёт считают окна в МСК — события, случившиеся 07:00-10:00 МСК
+    (время утреннего Follow-up), проваливались между днями. Колонка в database.py уже
+    переведена на московское время для новых событий; здесь — разовый сдвиг старых записей
+    (+3 часа), чтобы и прошлые дни считались верно. Флаг в system_flags — защита от повторного
+    сдвига при каждом рестарте.
+
+    ВАЖНО: должна вызываться из database.init_db() ДО backfill_missing_status_events().
+    Часть событий, которые создаёт backfill, уже берёт МСК-время (message_sent_at) — если
+    сдвинуть их ПОСЛЕ, они станут неверными на +3 часа."""
+    if await db.get_flag(FLAG_LEAD_EVENTS_TZ):
+        return
+
+    async with db.engine.begin() as conn:
+        result = await conn.execute(text("SELECT COUNT(*) FROM lead_events"))
+        count = result.scalar() or 0
+        if count:
+            await conn.execute(text(
+                "UPDATE lead_events SET timestamp = datetime(timestamp, '+3 hours')"
+            ))
+
+    await db.set_flag(FLAG_LEAD_EVENTS_TZ)
+    if count:
+        logger.info(f"Миграция часового пояса: сдвинуто событий lead_events — {count}")

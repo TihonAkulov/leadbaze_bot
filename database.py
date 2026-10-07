@@ -122,7 +122,7 @@ class LeadEvent(Base):
     lead_id: Mapped[int] = mapped_column(ForeignKey("leads.id"))
     event_type: Mapped[str] = mapped_column(String)
     message_id: Mapped[Optional[int]] = mapped_column(ForeignKey("messages.id"), nullable=True)
-    timestamp: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+    timestamp: Mapped[dt.datetime] = mapped_column(DateTime, default=moscow_now)
     details: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     amount: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # сумма сделки — только для client_closed
 
@@ -142,6 +142,14 @@ class Backup(Base):
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
     file_path: Mapped[str] = mapped_column(String)
     kind: Mapped[str] = mapped_column(String, default="manual")  # manual / auto
+
+
+class SystemFlag(Base):
+    """Флаги одноразовых миграций данных (идемпотентность) — ключ/значение, ничего больше."""
+    __tablename__ = "system_flags"
+
+    key: Mapped[str] = mapped_column(String, primary_key=True)
+    value: Mapped[str] = mapped_column(String)
 
 
 class User(Base):
@@ -174,11 +182,28 @@ class DailyReport(Base):
 # Инициализация и миграция схемы
 # ---------------------------------------------------------------------------
 
+async def get_flag(key: str) -> Optional[str]:
+    async with async_session() as session:
+        row = await session.get(SystemFlag, key)
+        return row.value if row else None
+
+
+async def set_flag(key: str, value: str = "done") -> None:
+    async with async_session() as session:
+        row = await session.get(SystemFlag, key)
+        if row:
+            row.value = value
+        else:
+            session.add(SystemFlag(key=key, value=value))
+        await session.commit()
+
+
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     import migrations
     await migrations.migrate_old_schema()
+    await migrations.fix_lead_events_timezone()  # до backfill! см. комментарий в migrations.py
     await backfill_missing_status_events()
 
 
